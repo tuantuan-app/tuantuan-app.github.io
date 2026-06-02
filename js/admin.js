@@ -165,9 +165,9 @@
               <span class="muted sm" v-if="!(h.buildings||[]).length">暂无楼栋</span>
             </div>
             <div class="cat-add" style="margin-top:6px">
-              <input :id="'bld-'+h.id" :ref="el => bldInputs[h.id]=el" placeholder="添加楼栋，如：A 栋" @keyup.enter="addBld(h)" style="font-size:12px" />
-              <button class="btn btn--sm btn--primary" @click="addBld(h)">＋ 添加</button>
-              <button class="btn btn--sm btn--ghost" @click="bulkBld(h)" style="font-size:11px">📝 批量编辑</button>
+              <input :id="'bld-'+h.id" :ref="el => bldInputs[h.id]=el" :disabled="pending[h.id]" placeholder="添加楼栋，如：A 栋" @keyup.enter="addBld(h)" style="font-size:12px" />
+              <button class="btn btn--sm btn--primary" @click="addBld(h)" :disabled="pending[h.id]">{{ pending[h.id] ? '添加中…' : '＋ 添加' }}</button>
+              <button class="btn btn--sm btn--ghost" @click="bulkBld(h)" :disabled="pending[h.id]" style="font-size:11px">📝 批量编辑</button>
             </div>
           </div>
           <div class="admin-shop__actions">
@@ -196,11 +196,24 @@
         else store.showToast('请复制此链接：' + link, 'info');
       }
       function del(h) { if (window.confirm('删除社区「' + h.name + '」？该社区下的商家不会被删除，但需重新分配社区。')) store.removeHub(h.id); }
-      function addBld(h) {
+      // 串行 + 等服务器回包再清空：之前并发 Enter 多个楼栋，乱序响应整列覆盖会"丢"楼栋
+      const pending = reactive({}); // { hubId: true } 当 hub 有正在飞的请求
+      async function addBld(h) {
+        if (pending[h.id]) return; // 上一个还没回，先别按
         var el = bldInputs[h.id]; var name = el ? el.value.trim() : '';
         if (!name) return;
-        store.adminAddBuilding(h.id, name);
-        if (el) el.value = '';
+        if ((h.buildings || []).indexOf(name) >= 0) {
+          if (el) { el.value = ''; el.focus(); }
+          return; // 本地去重：避免给后端发明显重复
+        }
+        pending[h.id] = true;
+        try {
+          const ok = await store.adminAddBuilding(h.id, name);
+          if (ok && el) el.value = ''; // 只在成功时清空，失败保留让用户改了再试
+        } finally {
+          pending[h.id] = false;
+          if (el) el.focus(); // 连续添加时光标回到输入框
+        }
       }
       function rmBld(h, name) { if (window.confirm('从 ' + h.name + ' 删除楼栋「' + name + '」？\n\n该楼栋将从商家可选的覆盖范围中移除。')) store.adminRemoveBuilding(h.id, name); }
       function bulkBld(h) {
@@ -210,7 +223,7 @@
         var list = input.split('\n').map(function (s) { return s.trim(); }).filter(Boolean);
         store.adminSaveBuildings(h.id, list);
       }
-      return { store, form, error, bldInputs, count, add, rename, copyLink, del, addBld, rmBld, bulkBld };
+      return { store, form, error, bldInputs, count, add, rename, copyLink, del, addBld, rmBld, bulkBld, pending };
     },
   };
 
@@ -225,7 +238,7 @@
           <div class="admin-shop">
             <div class="shop-card__logo">{{ m.logo }}</div>
             <div class="admin-shop__body">
-              <div class="shop-card__name">{{ m.name }}<span class="pill-tag" :class="m.open ? 'pill-tag--open' : 'pill-tag--closed'">{{ m.open ? '营业中' : '休息中' }}</span><span class="plan-badge" :class="'plan-badge--'+store.planStatus(m).key">{{ store.planStatus(m).label }}</span></div>
+              <div class="shop-card__name">{{ m.name }}<span class="pill-tag" :class="m.open ? 'pill-tag--open' : 'pill-tag--closed'">{{ m.open ? '营业中' : '休息中' }}</span><span class="plan-badge" :class="'plan-badge--'+store.planStatus(m).key">{{ store.planStatus(m).label }}</span><span v-if="m.isTest" class="plan-badge" style="background:#fef3c7;color:#92400e">🧪 测试</span></div>
               <div class="shop-card__desc">{{ m.desc }}</div>
               <div class="shop-card__meta">{{ m.menu.length }} 个商品 · {{ store.ordersOf(m.id).length }} 张订单 · 📍 {{ m.hubId ? store.hubLabel(m.hubId) : '未分配社区' }}</div>
               <div class="cred" v-if="acc(m)">🔑 登录账号：<b>{{ acc(m).username }}</b></div>
@@ -266,12 +279,17 @@
                 </label>
               </div>
               <div v-if="!isNew" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
-                <button type="button" class="btn btn--sm btn--ghost" @click="form.password = '1234'; showPw = true">🔑 重置为 1234</button>
-                <button type="button" class="btn btn--sm btn--ghost" @click="form.password = randomPwd(); showPw = true">🎲 随机生成</button>
+                <!-- C13 fix: replaced hardcoded weak password with random generator -->
+                <button type="button" class="btn btn--sm btn--ghost" @click="form.password = randomPwd(); showPw = true">🔑 随机重置密码</button>
                 <button type="button" class="btn btn--sm btn--ghost" @click="copyPwd" :disabled="!form.password">📋 复制</button>
               </div>
               <p class="muted sm" v-if="!isNew">账号不可改；留空密码则保持原密码不变。</p>
             </div>
+            <!-- 测试商家标记：客户端首页不会显示，仅 admin 可见用于测试隔离 -->
+            <label class="fee-toggle" style="margin-top:10px;padding:10px;background:#fef3c7;border-radius:6px">
+              <input type="checkbox" v-model="form.isTest" />
+              <span>🧪 <b>测试商家</b>（客户端首页隐身，仅 admin 可见。上线后测试新功能用）</span>
+            </label>
             <p class="error" v-if="error">{{ error }}</p>
             <button class="btn btn--primary btn--block" @click="save">{{ isNew ? '创建并发放账号' : '保存修改' }}</button>
           </div>
@@ -280,7 +298,7 @@
     `,
     setup() {
       const editing = ref(null); const isNew = ref(false); const error = ref('');
-      const form = reactive({ name: '', desc: '', logo: '🏪', tngLabel: '', hubId: '', username: '', password: '' });
+      const form = reactive({ name: '', desc: '', logo: '🏪', tngLabel: '', hubId: '', username: '', password: '', isTest: false });
       const showPw = ref(false);
       function randomPwd() {
         // 8 位随机字母数字（去除易混 0/O/I/l）
@@ -296,11 +314,12 @@
         ); else window.prompt('复制密码：', form.password);
       }
       function acc(m) { return store.accountOf(m.id); }
-      function openNew() { isNew.value = true; error.value = ''; editing.value = 'new'; Object.assign(form, { name: '', desc: '', logo: '🏪', tngLabel: '', hubId: (store.state.hubs[0] && store.state.hubs[0].id) || '', username: '', password: '1234' }); }
+      // C13 fix: generate random password instead of hardcoded '1234'
+      function openNew() { isNew.value = true; error.value = ''; editing.value = 'new'; Object.assign(form, { name: '', desc: '', logo: '🏪', tngLabel: '', hubId: (store.state.hubs[0] && store.state.hubs[0].id) || '', username: '', password: randomPwd(), isTest: false }); }
       function openEdit(m) {
         isNew.value = false; error.value = ''; editing.value = m;
         const a = acc(m);
-        Object.assign(form, { name: m.name, desc: m.desc, logo: m.logo, tngLabel: m.tngLabel, hubId: m.hubId || '', username: a ? a.username : '', password: '' });
+        Object.assign(form, { name: m.name, desc: m.desc, logo: m.logo, tngLabel: m.tngLabel, hubId: m.hubId || '', username: a ? a.username : '', password: '', isTest: !!m.isTest });
       }
       function save() {
         if (!form.name.trim()) return (error.value = '请填写店名');
@@ -308,9 +327,9 @@
           if (!form.username.trim()) return (error.value = '请填写商家登录账号');
           if (store.usernameTaken(form.username)) return (error.value = '该账号已被占用');
           if (!form.password) return (error.value = '请设置密码');
-          store.registerMerchant({ name: form.name.trim(), desc: form.desc.trim(), logo: form.logo.trim() || '🏪', tngLabel: form.tngLabel.trim() || form.name.trim(), hubId: form.hubId, username: form.username.trim(), password: form.password });
+          store.registerMerchant({ name: form.name.trim(), desc: form.desc.trim(), logo: form.logo.trim() || '🏪', tngLabel: form.tngLabel.trim() || form.name.trim(), hubId: form.hubId, username: form.username.trim(), password: form.password, isTest: !!form.isTest });
         } else {
-          store.updateMerchant(editing.value.id, { name: form.name.trim(), desc: form.desc.trim(), logo: form.logo.trim() || '🏪', tngLabel: form.tngLabel.trim() || form.name.trim(), hubId: form.hubId });
+          store.updateMerchant(editing.value.id, { name: form.name.trim(), desc: form.desc.trim(), logo: form.logo.trim() || '🏪', tngLabel: form.tngLabel.trim() || form.name.trim(), hubId: form.hubId, isTest: !!form.isTest });
           if (form.password) store.setMerchantPassword(editing.value.id, form.password);
         }
         error.value = ''; editing.value = null;

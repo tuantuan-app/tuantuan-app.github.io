@@ -325,21 +325,50 @@
     const subtotal = Number(r.subtotal) || items.reduce((s, it) => s + it.price * it.qty, 0);
     return {
       id: r.orderId || r.id || utils.genOrderId(), merchantId: r.vendorId,
+      hubId: r.hubId || r.HubID || r.hub_id || '',
       createdAt: r.createdAt ? (Date.parse(r.createdAt) || Date.now()) : Date.now(), createdAtText: String(r.createdAt || ''),
       customer: { name: r.customerName || '', phone: r.phone || '', building: r.building || '', room: r.room || '' }, remark: r.remark || '',
       items, subtotal, packagingFee: Number(r.packagingFee) || 0, deliveryFee: Number(r.deliveryFee) || 0,
       total: Number(r.total) || subtotal, deliveryMode: r.deliveryMode || 'fixed', deliveryTime: r.deliveryTime || '',
       screenshot: utils.fastDriveImg(r.screenshotUrl || r.screenshot || ''), status: r.status || 'pending', rejectReason: r.rejectReason || '', deliveryPhoto: utils.fastDriveImg(r.deliveryPhotoUrl || ''),
       membershipJson: r.membershipJson || '',
+      imagesPurgedAt: r.imagesPurgedAt || '', // 30 天前订单图片已清理标记（仅 UI 提示用）
     };
   }
 
   function mapRemoteItem(it) {
     const avail = it.available === true || String(it.available).toUpperCase() === 'TRUE';
-    const stock = (it.stock === '' || it.stock === null || it.stock === undefined) ? null : Number(it.stock);
+    const n = Number(it.stock);
+    const stock = (it.stock === '' || it.stock === null || it.stock === undefined || isNaN(n)) ? null : n;
     let optionGroups = []; try { optionGroups = it.optionsJson ? JSON.parse(it.optionsJson) : []; } catch (e) {}
     let discount = null; try { discount = it.discountJson ? JSON.parse(it.discountJson) : null; } catch (e) {}
     return { id: it.itemId, name: it.name, price: Number(it.price) || 0, available: avail, emoji: it.emoji || '🍽️', image: it.image || '', desc: it.desc || '', category: it.category || '食物', stock: stock, optionGroups: Array.isArray(optionGroups) ? optionGroups : [], discount: discount };
+  }
+
+  // C18 fix: 为 sync 队列生成稳定的去重键。每种 action 显式取它真正的"实体 ID"，
+  // 而不是用顶层 vendorId/itemId/orderId（嵌套对象里的 ID 顶层永远 undefined）。
+  // 同键 → 同实体的连续操作合并；不同键 → 即使同 action 也分别入队。
+  function syncKey(p) {
+    var a = p.action;
+    switch (a) {
+      case 'saveProduct':       return a + ':' + (p.product && p.product.itemId);
+      case 'addPayment':        return a + ':' + (p.payment && p.payment.payId);
+      case 'upsertVendor':      return a + ':' + (p.vendor && p.vendor.vendorId);
+      case 'removeProduct':     return a + ':' + p.itemId;
+      case 'updateOrderStatus':
+      case 'cancelOrder':
+      case 'attachScreenshot':  return a + ':' + p.orderId;
+      case 'saveVendorConfig':
+      case 'saveVendorPlan':    return a + ':' + p.vendorId;
+      case 'addHubBuilding':
+      case 'removeHubBuilding': return a + ':' + p.hubId + ':' + p.name; // 同 hub 不同 name 不合并
+      case 'saveHub':
+      case 'removeHub':
+      case 'saveHubBuildings':  return a + ':' + p.hubId;
+      case 'saveSubscription':  return a + ':' + (p.subscription && p.subscription.endpoint);
+      case 'placeOrder':        return a + ':' + (p.order && p.order.orderId);
+      default:                  return a + ':' + JSON.stringify(p).slice(0, 200); // 兜底，永不误合并不同 payload
+    }
   }
 
   // ---- v3: 序列化前剥离 base64 大字段 ----
@@ -351,8 +380,9 @@
         if (m.menu) m.menu.forEach(function (it) { if (utils.isImg(it.image)) it.image = ''; });
       });
       if (d.orders) d.orders.forEach(function (o) {
-        if (utils.isImg(o.screenshot)) o.screenshot = '';
-        if (utils.isImg(o.deliveryPhoto)) o.deliveryPhoto = '';
+        // C20 fix: only strip already-uploaded shots (Drive URLs), keep pending base64
+        if (utils.isImg(o.screenshot) && o.imgStatus === 'ok') o.screenshot = '';
+        if (utils.isImg(o.deliveryPhoto) && o.imgStatus === 'ok') o.deliveryPhoto = '';
       });
       return JSON.stringify(d);
     } catch (e) { return s; }
@@ -374,7 +404,18 @@
       return p;
     } catch (e) { return null; }
   }
-  function readHub() { try { return (new URLSearchParams(location.search).get('hub') || '').trim().toLowerCase(); } catch (e) { return ''; } }
+  // 客户选的社区：优先 URL ?hub= → 其次 localStorage → 否则空（首次访问 → 弹选择器）
+  var HUB_KEY = 'canteen_hub_v1';
+  function readHub() {
+    try {
+      var u = (new URLSearchParams(location.search).get('hub') || '').trim().toLowerCase();
+      if (u) { try { localStorage.setItem(HUB_KEY, u); } catch (e) {} return u; }
+      var s = localStorage.getItem(HUB_KEY); return s ? s.trim().toLowerCase() : '';
+    } catch (e) { return ''; }
+  }
+  function writeHub(hubId) {
+    try { localStorage.setItem(HUB_KEY, String(hubId || '').toLowerCase()); } catch (e) {}
+  }
   function loadAuth() {
     try {
       const r = localStorage.getItem(AUTH_KEY); if (!r) return null;
@@ -406,7 +447,12 @@
     selectedAddrId: null, // 地址簿当前选中的地址 id（不持久化；空 → 走默认地址）
   });
   const _auth = loadAuth() || {};
-  const auth = reactive({ user: _auth.user || (_auth.username ? _auth : null), token: _auth.token || '' });
+  // 在线模式下：localStorage 里没 token = 上次「假登入」残留 → 视为未登录
+  // （避免改密码后/前端 bug 导致空 token 还能进 admin 页面）
+  var _online = !!(window.APP_CONFIG && window.APP_CONFIG.apiBase);
+  var _hasValidAuth = _auth.user && (!_online || _auth.token);
+  if (!_hasValidAuth && _auth.user) { try { localStorage.removeItem(AUTH_KEY); } catch (e) {} }
+  const auth = reactive({ user: _hasValidAuth ? (_auth.user || (_auth.username ? _auth : null)) : null, token: _hasValidAuth ? (_auth.token || '') : '' });
   if (auth.user && auth.user.merchantId) ui.merchantId = auth.user.merchantId;
 
   // ---- v3: Toast 通知系统 ----
@@ -441,6 +487,11 @@
     get visibleMerchants() { return this.currentHub ? state.merchants.filter((m) => (m.hubId || '') === this.currentHub) : state.merchants; },
     hubLabel(id) { const h = state.hubs.find((x) => x.id === id); return h ? h.name : (id ? id.toUpperCase() + ' 团团' : ''); },
     currentHubLabel() { return this.currentHub ? this.hubLabel(this.currentHub) : ''; },
+    setCurrentHub(hubId) {
+      var id = String(hubId || '').toLowerCase().trim();
+      this.currentHub = id;
+      writeHub(id);
+    },
     addHub(id, name) { id = (id || '').trim().toLowerCase(); if (!id) return false; if (state.hubs.some((h) => h.id === id)) return false; const nm = (name || '').trim() || id.toUpperCase() + ' 团团'; state.hubs.push({ id, name: nm }); this.sync_({ action: 'saveHub', hubId: id, name: nm }); return true; },
     updateHub(id, name) { const h = state.hubs.find((x) => x.id === id); if (h) { h.name = (name || '').trim() || h.name; this.sync_({ action: 'saveHub', hubId: id, name: h.name }); } },
     removeHub(id) { state.hubs = state.hubs.filter((h) => h.id !== id); this.sync_({ action: 'removeHub', hubId: id }); },
@@ -451,6 +502,46 @@
         var r = await window.api.listHubs();
         if (r && r.ok && Array.isArray(r.hubs)) {
           state.hubs = r.hubs.map(function (h) { var b = []; try { b = h.buildingsJson ? JSON.parse(h.buildingsJson) : []; } catch (e) {} return { id: h.hubId, name: h.name, buildings: Array.isArray(b) ? b : [] }; });
+        }
+      } catch (e) {}
+    },
+    // 在线模式下：从后端拉真实商家列表（已过滤 TEST + 停业），清掉本地硬编码 demo
+    async loadPublicVendors() {
+      if (!(window.api && window.api.enabled())) return;
+      try {
+        var r = await window.api.listPublicVendors();
+        if (r && r.ok && Array.isArray(r.vendors)) {
+          // 重置 state.merchants 为真后端数据；保留 admin 已登入的本店设置（如有）
+          var keepIds = (auth.user && auth.user.role === 'merchant' && auth.user.merchantId) ? [auth.user.merchantId] : [];
+          var kept = state.merchants.filter(function (m) { return keepIds.indexOf(m.id) >= 0; });
+          var fresh = r.vendors.map(function (v) {
+            var existing = state.merchants.find(function (m) { return m.id === v.vendorId; });
+            return existing ? Object.assign(existing, {
+              name: v.shopName || existing.name,
+              logo: v.logo || existing.logo,
+              tngLabel: v.tngLabel || existing.tngLabel,
+              plan: v.plan || 'basic',
+              planUntil: v.planUntil || '',
+              hubId: v.hubId || existing.hubId,
+              open: typeof v.open === 'boolean' ? v.open : existing.open,
+              settings: v.settings ? Object.assign(defaultSettings('fixed'), v.settings) : existing.settings,
+              payQRs: Array.isArray(v.payQRs) ? v.payQRs : existing.payQRs,
+              categories: Array.isArray(v.categories) && v.categories.length ? v.categories : existing.categories,
+            }) : {
+              id: v.vendorId, name: v.shopName, desc: '', logo: v.logo || '🏪',
+              open: typeof v.open === 'boolean' ? v.open : true,
+              tngLabel: v.tngLabel || '', plan: v.plan || 'basic', planUntil: v.planUntil || '',
+              hubId: v.hubId || '',
+              settings: v.settings ? Object.assign(defaultSettings('fixed'), v.settings) : defaultSettings('fixed'),
+              payQRs: Array.isArray(v.payQRs) ? v.payQRs : [],
+              categories: Array.isArray(v.categories) && v.categories.length ? v.categories : ['食物', '小吃', '饮料'],
+              menu: [],
+            };
+          });
+          // 合并：fresh + 商家自己的本店（如果不在 fresh 里）
+          var merged = fresh.slice();
+          kept.forEach(function (m) { if (!merged.find(function (x) { return x.id === m.id; })) merged.push(m); });
+          state.merchants = merged;
         }
       } catch (e) {}
     },
@@ -469,7 +560,7 @@
           }
         } catch (e) {}
         // 在线添加失败（断网/后端拒绝）：不写入覆盖列表，避免出现「池里没有、却出现在客户下拉」的脏数据
-        if (!added) { this.toastError('楼栋添加失败，请检查网络后重试'); return; }
+        if (!added) { this.toastError('网络有点慢，请刷新页面再试'); return; }
       } else {
         var h2 = state.hubs.find(function (x) { return x.id === m.hubId; });
         if (h2) { if (!h2.buildings) h2.buildings = []; if (h2.buildings.indexOf(name) < 0) h2.buildings.push(name); }
@@ -481,26 +572,73 @@
     },
 
     // ===== Admin 楼栋管理 =====
+    // 之前的版本：失败/超时静默吞掉，UI 还像加成功了；并发请求乱序到达时整列覆盖把已加的覆盖没了；
+    //            demo 模式没后端时也走在线分支 → 永远失败、还无 toast。
+    // 现在：① 返回 boolean 给调用方做串行控制（后端 LockService + 前端 await，双保险）
+    //      ② 离线/demo 直接写本地，与 merchant 端 addBuildingToHub 一致
+    //      ③ 失败大声 toast，不再静默吞
     async adminAddBuilding(hubId, name) {
-      name = (name || '').trim(); if (!name) return;
-      var r = await window.api.addHubBuilding(hubId, name, auth.token);
-      if (r && r.ok && Array.isArray(r.buildings)) {
-        var h = state.hubs.find(function (x) { return x.id === hubId; });
-        if (h) h.buildings = r.buildings; else state.hubs.push({ id: hubId, name: hubId, buildings: r.buildings });
+      name = (name || '').trim(); if (!name) return false;
+      if (!(window.api && window.api.enabled())) {
+        // 离线/demo：本地直接 push，去重
+        var hL = state.hubs.find(function (x) { return x.id === hubId; });
+        if (hL) { if (!hL.buildings) hL.buildings = []; if (hL.buildings.indexOf(name) < 0) hL.buildings.push(name); }
+        else state.hubs.push({ id: hubId, name: hubId, buildings: [name] });
+        return true;
+      }
+      try {
+        var r = await window.api.addHubBuilding(hubId, name, auth.token);
+        if (r && r.ok && Array.isArray(r.buildings)) {
+          var h = state.hubs.find(function (x) { return x.id === hubId; });
+          if (h) h.buildings = r.buildings; else state.hubs.push({ id: hubId, name: hubId, buildings: r.buildings });
+          return true;
+        }
+        this.toastError('添加楼栋失败：' + ((r && r.error) || '后端没回应（检查登录态/网络）'));
+        return false;
+      } catch (e) {
+        this.toastError('添加楼栋失败：' + (e.message || e));
+        return false;
       }
     },
     async adminRemoveBuilding(hubId, name) {
-      var r = await window.api.removeHubBuilding(hubId, name, auth.token);
-      if (r && r.ok && Array.isArray(r.buildings)) {
-        var h = state.hubs.find(function (x) { return x.id === hubId; });
-        if (h) h.buildings = r.buildings;
+      if (!(window.api && window.api.enabled())) {
+        var hL = state.hubs.find(function (x) { return x.id === hubId; });
+        if (hL && hL.buildings) { var i = hL.buildings.indexOf(name); if (i >= 0) hL.buildings.splice(i, 1); }
+        return true;
+      }
+      try {
+        var r = await window.api.removeHubBuilding(hubId, name, auth.token);
+        if (r && r.ok && Array.isArray(r.buildings)) {
+          var h = state.hubs.find(function (x) { return x.id === hubId; });
+          if (h) h.buildings = r.buildings;
+          return true;
+        }
+        this.toastError('删除楼栋失败：' + ((r && r.error) || '后端没回应'));
+        return false;
+      } catch (e) {
+        this.toastError('删除楼栋失败：' + (e.message || e));
+        return false;
       }
     },
     async adminSaveBuildings(hubId, buildings) {
-      var r = await window.api.saveHubBuildings(hubId, buildings, auth.token);
-      if (r && r.ok && Array.isArray(r.buildings)) {
-        var h = state.hubs.find(function (x) { return x.id === hubId; });
-        if (h) h.buildings = r.buildings; else state.hubs.push({ id: hubId, name: hubId, buildings: r.buildings });
+      if (!(window.api && window.api.enabled())) {
+        var hL = state.hubs.find(function (x) { return x.id === hubId; });
+        if (hL) hL.buildings = (buildings || []).slice();
+        else state.hubs.push({ id: hubId, name: hubId, buildings: (buildings || []).slice() });
+        return true;
+      }
+      try {
+        var r = await window.api.saveHubBuildings(hubId, buildings, auth.token);
+        if (r && r.ok && Array.isArray(r.buildings)) {
+          var h = state.hubs.find(function (x) { return x.id === hubId; });
+          if (h) h.buildings = r.buildings; else state.hubs.push({ id: hubId, name: hubId, buildings: r.buildings });
+          return true;
+        }
+        this.toastError('保存楼栋失败：' + ((r && r.error) || '后端没回应'));
+        return false;
+      } catch (e) {
+        this.toastError('保存楼栋失败：' + (e.message || e));
+        return false;
       }
     },
 
@@ -615,12 +753,18 @@
     adminData: { orders: [], vendors: [], loaded: false },
     async refreshAdminData() {
       if (!(window.api && window.api.enabled())) return;
+      // 没拿到 admin token 直接 bail（避免「假登入」状态下乱报错）
+      // 真 admin 登录成功 → auth.token 有值 → 才查后端
+      if (!auth.token) return;
       try {
         var results = await Promise.all([this._send({ action: 'listAllOrders' }), this._send({ action: 'listVendors' })]);
         if (results[0] && results[0].ok) this.adminData.orders = results[0].orders || [];
         if (results[1] && results[1].ok) this.adminData.vendors = results[1].vendors || [];
         this.adminData.loaded = true;
-      } catch (e) { this.toastError('加载经营数据失败'); }
+      } catch (e) {
+        // admin 端不掩饰技术错误，方便排查
+        this.toastError('加载经营数据失败：' + ((e && e.message) || e));
+      }
     },
     analytics() {
       if (window.api && window.api.enabled()) {
@@ -645,16 +789,16 @@
       return r;
     },
     // v3: 300ms 防抖合并窗口
+    // C18 fix: 去重键之前用顶层 vendorId/itemId/orderId，但 addPayment/saveProduct/upsertVendor
+    // 的 ID 都在嵌套对象里 → 顶层三字段全 undefined → 同 action 不同 ID 的两个调用被错合并 →
+    // 第二笔 payment 把第一笔覆盖 → 财务数据丢失。改用 syncKey() 为每种 action 显式取真实 ID。
     sync_(payload) {
       if (!(window.api && window.api.enabled())) return;
       var self = this;
-      // 合并同类操作：如果队列中已有同 action+同 ID 的操作，替换之
+      var newKey = syncKey(payload);
       var dupIdx = -1;
       for (var i = 0; i < self._syncQueue.length; i++) {
-        var q = self._syncQueue[i];
-        if (q.action === payload.action && q.vendorId === payload.vendorId && q.itemId === payload.itemId && q.orderId === payload.orderId) {
-          dupIdx = i; break;
-        }
+        if (syncKey(self._syncQueue[i]) === newKey) { dupIdx = i; break; }
       }
       if (dupIdx >= 0) self._syncQueue[dupIdx] = payload;
       else self._syncQueue.push(payload);
@@ -672,8 +816,10 @@
         catch (e) { self.failedSyncs.push(batch[i]); self.syncError = String((e && e.message) || e); }
       }
       self.syncBusy = false;
-      if (self.failedSyncs.length) self.toastError(self.failedSyncs.length + ' 项同步失败，可点底部重试');
+      if (self.failedSyncs.length) self.toastError('网络有点慢，请刷新页面再试');
       else self.syncError = '';
+      // C19 fix: if more items queued during flush, process them
+      if (self._syncQueue.length) setTimeout(function () { self._flushSync(); }, 50);
     },
     async retrySync() {
       if (!this.failedSyncs.length || this.syncBusy) return;
@@ -687,8 +833,8 @@
     applyRemoteOrder(remote) {
       if (!remote) return;
       var o = this.getOrder(remote.orderId); if (!o) return;
-      // 保护客户端刚点的"取消"：8s 内别让 stale poll 把 'cancelled' 冲回 'pending'
-      var protect = o._localMutAt && (Date.now() - o._localMutAt) < 8000 && remote.status !== o.status;
+      // 保护客户端刚点的"取消"：M8 fix 从 8s 延到 15s（高延迟场景下 GAS 响应慢 + 边缘缓存 TTL 叠加可能超 8s）
+      var protect = o._localMutAt && (Date.now() - o._localMutAt) < 15000 && remote.status !== o.status;
       if (protect) {
         // 仅同步非冲突字段
         if (remote.deliveryPhotoUrl && !o.deliveryPhoto) o.deliveryPhoto = utils.fastDriveImg(remote.deliveryPhotoUrl);
@@ -819,8 +965,14 @@
         }) };
         if (!this.profile.addresses.some(function (a) { return a.isDefault; })) this.profile.addresses[0].isDefault = true;
       } else if (prev && Array.isArray(prev.addresses) && prev.addresses.length) {
-        // 已存在地址簿 + 只改 name/phone：保留 addresses
-        this.profile = { name: name, phone: phone, addresses: prev.addresses };
+        // 已存在地址簿 + 更新 name/phone + building/room（更新默认地址）
+        var addrs = prev.addresses.map(function (a) {
+          var updated = Object.assign({}, a);
+          if (p.building !== undefined) updated.building = utils.sanitize(p.building, 60);
+          if (p.room !== undefined) updated.room = utils.sanitize(p.room, 30);
+          return updated;
+        });
+        this.profile = { name: name, phone: phone, addresses: addrs };
       } else {
         // 首次填号或老数据：把 building/room 作为第一条默认地址
         this.profile = { name: name, phone: phone, addresses: [{ id: 'a' + Date.now(), label: '默认地址', building: utils.sanitize(p.building, 60), room: utils.sanitize(p.room, 30), isDefault: true }] };
@@ -971,7 +1123,7 @@
           // 下单成功 → 软引导客户开通通知（仅在 default 状态时弹一次，dismiss 后 7 天不再问）
           try { if (window.notify && o.customer && o.customer.phone) window.notify.promptCustomerAfterOrder(o.customer.phone); } catch (_) {}
         } else {
-          x.syncStatus = 'rejected'; x.syncError = (r && r.error) || '订单未通过校验'; self._clearOrderRetry(orderId); // 库存/截止/券等：重试无用
+          x.syncStatus = 'rejected'; x.syncError = (r && r.error) || '网络有点慢，请刷新页面再试'; self._clearOrderRetry(orderId); // 库存/截止/券等：重试无用
         }
       }).catch(function () {
         var x = self.getOrder(orderId); if (x && x.syncStatus !== 'synced' && x.syncStatus !== 'rejected') { x.syncStatus = 'pending'; self._scheduleOrderRetry(orderId); } // 断网/冷启动超时：后台续命重试
@@ -1010,9 +1162,30 @@
 
     // 状态流转
     // 商家端的乐观状态变更：盖 _localMutAt 时间戳，避免在途的旧 poll 把刚改的状态冲回去（见 applyVendorOrders 的保护窗）
-    approveOrder(id) { var o = this.getOrder(id); if (o) { o.status = 'cooking'; o._localMutAt = Date.now(); try { window.merchantRinger && window.merchantRinger.stop(id); } catch (_) {} this.sync_({ action: 'updateOrderStatus', orderId: id, status: 'cooking' }); } },
-    rejectOrder(id, reason) { var o = this.getOrder(id); if (o) { o.status = 'rejected'; o.rejectReason = reason || '商家未通过对账'; o._localMutAt = Date.now(); try { window.merchantRinger && window.merchantRinger.stop(id); } catch (_) {} this.sync_({ action: 'updateOrderStatus', orderId: id, status: 'rejected', rejectReason: o.rejectReason }); } },
-    advanceOrder(id) { var o = this.getOrder(id); if (!o) return; var f = ['pending', 'cooking', 'delivering', 'delivered']; var i = f.indexOf(o.status); if (i >= 0 && i < f.length - 1) { o.status = f[i + 1]; o._localMutAt = Date.now(); this.sync_({ action: 'updateOrderStatus', orderId: id, status: o.status, deliveryPhoto: o.status === 'delivered' ? o.deliveryPhoto : '' }); } },
+    // C2 fix: status guards prevent invalid transitions
+    approveOrder(id) { var o = this.getOrder(id); if (o && o.status === 'pending') { o.status = 'cooking'; o._localMutAt = Date.now(); try { window.merchantRinger && window.merchantRinger.stop(id); } catch (_) {} this.sync_({ action: 'updateOrderStatus', orderId: id, status: 'cooking' }); } },
+    rejectOrder(id, reason) {
+      var o = this.getOrder(id);
+      if (o && o.status === 'pending') {
+        o.status = 'rejected'; o.rejectReason = reason || '商家未通过对账'; o._localMutAt = Date.now();
+        try { window.merchantRinger && window.merchantRinger.stop(id); } catch (_) {}
+        // H16 fix: optimistically restore stock for local/demo mode
+        if (o.items && o.items.length) {
+          var mid = o.merchantId; var m = this.getMerchant(mid);
+          if (m && m.menu) {
+            o.items.forEach(function (it) {
+              var menuItem = m.menu.find(function (x) { return x.id === it.id; });
+              if (menuItem && menuItem.stock !== null && menuItem.stock !== undefined && !isNaN(Number(menuItem.stock))) {
+                menuItem.stock = Number(menuItem.stock) + Number(it.qty || 0);
+              }
+            });
+          }
+        }
+        this.sync_({ action: 'updateOrderStatus', orderId: id, status: 'rejected', rejectReason: o.rejectReason });
+      }
+    },
+    // C2 fix: advanceOrder only from cooking→delivering→delivered (pending must go through approveOrder)
+    advanceOrder(id) { var o = this.getOrder(id); if (!o) return; var f = ['cooking', 'delivering', 'delivered']; var i = f.indexOf(o.status); if (i >= 0 && i < f.length - 1) { o.status = f[i + 1]; o._localMutAt = Date.now(); this.sync_({ action: 'updateOrderStatus', orderId: id, status: o.status, deliveryPhoto: o.status === 'delivered' ? o.deliveryPhoto : '' }); } },
     setDeliveryPhoto(id, d) { var o = this.getOrder(id); if (o) { o.deliveryPhoto = d; o._localMutAt = Date.now(); if (d) this.sync_({ action: 'updateOrderStatus', orderId: id, status: o.status, deliveryPhoto: d }); } },
     // 批量送达：一批订单一次性标记已送达，并共用同一张到货照片（同地点多客户，不必逐个拍照发）
     batchDeliver(ids, photo) {
@@ -1130,7 +1303,7 @@
     },
 
     // ===== 计费 / 套餐管理（admin 端）=====
-    PRO_PRICE: 29,  // 专业版月费（RM）
+    PRO_PRICE: 39,  // 专业版月费（RM）
     BASIC_PRICE: 29, // 基础版月费（RM）
     _daysUntil(ymd) { try { return Math.ceil((new Date(ymd + 'T23:59').getTime() - Date.now()) / 86400000); } catch (e) { return 9999; } },
     planStatus(m) {
@@ -1171,10 +1344,49 @@
       this._applyPlanLocal(mid, plan, planUntil || '');
       this.sync_({ action: 'saveVendorPlan', vendorId: mid, plan: plan, planUntil: planUntil || '' });
     },
+    // Admin 一键造测试商家：固定账号 test_basic / test_pro（密码 1234），灌 3 道菜让客户端能跑完整链路。
+    // 幂等：账号已存在 → 不再造，只把套餐校正回 plan 参数后返回原 id（保证按钮所见即所得）。
+    // 商家身上打 isTest='TEST'，可被「清除测试数据」按钮一并扫掉，不污染真实数据。
+    ensureTestMerchant(plan) {
+      plan = plan === 'pro' ? 'pro' : 'basic';
+      var username = plan === 'pro' ? 'test_pro' : 'test_basic';
+      var password = '1234';
+      var existed = state.accounts.find(function (a) { return a.username === username; });
+      if (existed) {
+        // 校正套餐（防止被「设为 basic」改过后按钮失真）
+        this.setVendorPlan(existed.merchantId, plan, plan === 'pro' ? '2099-12-31' : '');
+        return { id: existed.merchantId, username: username, password: password, created: false };
+      }
+      var hubId = (state.hubs[0] && state.hubs[0].id) || '';
+      var displayName = plan === 'pro' ? '🧪 测试·专业版商家' : '🧪 测试·基础版商家';
+      var id = this.registerMerchant({
+        name: displayName,
+        desc: plan === 'pro' ? '专业版功能测试用（会员/CRM/券）' : '基础版功能测试用',
+        logo: plan === 'pro' ? '💎' : '🆓',
+        tngLabel: displayName, hubId: hubId,
+        username: username, password: password, isTest: true,
+      });
+      if (plan === 'pro') this.setVendorPlan(id, 'pro', '2099-12-31');
+      // 灌 3 道菜，让客户端能完整下单（不灌的话菜单空，customer 走不通）
+      var m = this.getMerchant(id), self = this;
+      if (m) {
+        [
+          { name: '测试招牌饭', price: 8.0, emoji: '🍱', desc: '测试用·标准菜品', category: '食物' },
+          { name: '测试小食',   price: 4.5, emoji: '🍢', desc: '测试用·常规小吃', category: '小吃' },
+          { name: '测试饮料',   price: 2.5, emoji: '🥤', desc: '测试用·饮料',     category: '饮料' },
+        ].forEach(function (seed) {
+          var it = { id: utils.genId('it'), name: seed.name, price: seed.price, available: true, emoji: seed.emoji, image: '', desc: seed.desc, category: seed.category, stock: null };
+          m.menu.push(it); self._syncProduct(id, it);
+        });
+      }
+      return { id: id, username: username, password: password, created: true };
+    },
     // 记一笔收款（默认顺带续费：升到该套餐 + 到期日=本期结束）
     recordPayment(pmt) {
       var row = { payId: utils.genId('pay'), vendorId: pmt.vendorId, amount: Number(pmt.amount) || 0, plan: pmt.plan === 'pro' ? 'pro' : 'basic', paidAt: pmt.paidAt || utils.todayYMD(), periodStart: pmt.periodStart || '', periodEnd: pmt.periodEnd || '', note: pmt.note || '', isTest: pmt.isTest ? 'TEST' : '' };
       state.payments.unshift(row);
+      // H33 fix: pro plan requires periodEnd (no permanent/unlimited free pro)
+      if (row.plan === 'pro' && !row.periodEnd) { this.toastError('专业版套餐必须设置到期日'); return null; }
       if (pmt.applyPlan !== false) this._applyPlanLocal(pmt.vendorId, row.plan, row.periodEnd || undefined);
       this.sync_({ action: 'addPayment', payment: row, applyPlan: pmt.applyPlan !== false });
       return row;
@@ -1245,6 +1457,24 @@
       Object.assign(state, seedState());
       return { ok: true, local: true, message: 'Local data re-seeded' };
     },
+    // 清理 N 天前的订单图片（释放 Drive 配额）；仅 admin 调用，需后端鉴权
+    async purgeOldImages(days) {
+      if (!(window.api && window.api.enabled())) return { ok: false, error: '需要后端' };
+      try { return await window.api.purgeOldImages(days || 30, auth.token); }
+      catch (e) { return { ok: false, error: String(e) }; }
+    },
+    // 归档 N 天前的终态订单（释放 Sheet cell 配额）；仅 admin 调用
+    async archiveOldOrders(days) {
+      if (!(window.api && window.api.enabled())) return { ok: false, error: '需要后端' };
+      try { return await window.api.archiveOldOrders(days || 90, auth.token); }
+      catch (e) { return { ok: false, error: String(e) }; }
+    },
+    // 查询归档（admin 任意 / 商家自己 / 按 phone 查客户）
+    async getArchivedOrders(filter, limit, offset) {
+      if (!(window.api && window.api.enabled())) return { ok: false, error: '需要后端' };
+      try { return await window.api.getArchivedOrders(filter || {}, auth.token, limit || 100, offset || 0); }
+      catch (e) { return { ok: false, error: String(e) }; }
+    },
     isOpen(m) {
       if (!m) return false;
       var h = m.settings && m.settings.hours;
@@ -1274,7 +1504,7 @@
         username: utils.sanitize(data.username || '', 30),
         password: data.password
       };
-      state.merchants.push({ id: id, name: cleanData.name, desc: cleanData.desc, logo: cleanData.logo, open: true, hubId: cleanData.hubId, tngLabel: cleanData.tngLabel, settings: defaultSettings('fixed'), payQRs: [], categories: ['食物', '小吃', '饮料'], menu: [] });
+      state.merchants.push({ id: id, name: cleanData.name, desc: cleanData.desc, logo: cleanData.logo, open: true, hubId: cleanData.hubId, tngLabel: cleanData.tngLabel, settings: defaultSettings('fixed'), payQRs: [], categories: ['食物', '小吃', '饮料'], menu: [], isTest: data.isTest ? 'TEST' : '' });
       state.accounts.push({ username: cleanData.username, role: 'merchant', merchantId: id });
       this._syncVendor(id);
       return id;
@@ -1287,6 +1517,7 @@
       if (data.logo !== undefined) clean.logo = utils.sanitize(data.logo, 10);
       if (data.hubId !== undefined) clean.hubId = utils.sanitize(data.hubId, 30).toLowerCase();
       if (data.tngLabel !== undefined) clean.tngLabel = utils.sanitize(data.tngLabel, 60);
+      if (data.isTest !== undefined) clean.isTest = data.isTest ? 'TEST' : '';
       Object.assign(m, clean);
       this._syncVendor(id);
     },
@@ -1295,7 +1526,7 @@
     _syncVendor(id) {
       var m = this.getMerchant(id), a = this.accountOf(id);
       if (!m || !a) return;
-      this.sync_({ action: 'upsertVendor', vendor: { vendorId: id, username: a.username, shopName: m.name, logo: m.logo, tngLabel: m.tngLabel, hubId: m.hubId || '', active: !!m.open } });
+      this.sync_({ action: 'upsertVendor', vendor: { vendorId: id, username: a.username, shopName: m.name, logo: m.logo, tngLabel: m.tngLabel, hubId: m.hubId || '', active: !!m.open, isTest: m.isTest || '' } });
     },
     removeMerchant(id) {
       var idx = state.merchants.findIndex(function (m) { return m.id === id; }); if (idx < 0) return;
@@ -1340,10 +1571,35 @@
   var _lastPersisted = localStorage.getItem(STORAGE_KEY) || '';
 
   // v3: 分别监听需要持久化的顶层 key，而非整个 state
-  var _persistKeys = ['merchants', 'orders', 'accounts', 'activeOrderId', 'hubs'];
+  // M13 fix: payments 加入持久化 — 之前缺失，刷新页面会丢付款记录（财务对账缺数据）
+  var _persistKeys = ['merchants', 'orders', 'accounts', 'activeOrderId', 'hubs', 'payments'];
   _persistKeys.forEach(function (key) {
     watch(function () { return state[key]; }, function () { persistState(); }, { deep: true });
   });
+
+  // C21 fix: 按 id 增量合并，避免整数组覆盖丢数据
+  // 之前：两个标签页各自编辑不同行 → 后保存的把对方编辑覆盖（last-write-wins）
+  // 现在：按 id 合并，远端有的更新/插入，远端没有且本地无近期 mutation 的也清掉
+  //      保留 _localMutAt 戳保护刚改的本地行（15s 窗口，与 M8 对齐）
+  function mergeById(local, remote, idKey) {
+    if (!Array.isArray(remote)) return;
+    var seen = {};
+    remote.forEach(function (r) {
+      if (!r || r[idKey] == null) return;
+      seen[r[idKey]] = true;
+      var idx = local.findIndex(function (l) { return l[idKey] === r[idKey]; });
+      if (idx >= 0) Object.assign(local[idx], r);
+      else local.push(r);
+    });
+    // 远端真的删了的本地也跟着删；但 _localMutAt 在 15s 内的本地行不动（用户刚改还没同步走）
+    var now = Date.now();
+    for (var i = local.length - 1; i >= 0; i--) {
+      var row = local[i];
+      if (seen[row[idKey]]) continue;
+      if (row._localMutAt && (now - row._localMutAt) < 15000) continue;
+      local.splice(i, 1);
+    }
+  }
 
   // 跨标签页实时同步（v3: 防回声 — 收到 remote change 后 300ms 内不写入）
   window.addEventListener('storage', function (e) {
@@ -1352,11 +1608,12 @@
     _lastPersisted = e.newValue;
     try {
       var d = JSON.parse(e.newValue);
-      // 逐个赋值而非整体替换，保持 Vue 响应性
-      if (d.hubs) state.hubs = d.hubs;
-      if (d.merchants) state.merchants = d.merchants;
-      if (d.orders) state.orders = d.orders;
-      if (d.accounts) state.accounts = d.accounts;
+      // C21 fix: 按 id 增量合并而非整数组覆盖
+      if (d.hubs)     mergeById(state.hubs,     d.hubs,     'id');
+      if (d.merchants) mergeById(state.merchants, d.merchants, 'id');
+      if (d.orders)   mergeById(state.orders,   d.orders,   'id');
+      if (d.accounts) mergeById(state.accounts, d.accounts, 'username');
+      if (d.payments) mergeById(state.payments, d.payments, 'payId');
       if (d.activeOrderId !== undefined) state.activeOrderId = d.activeOrderId;
     } catch (err) {}
   });

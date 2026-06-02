@@ -103,6 +103,9 @@
       function startNew() { store.state.activeOrderId = null; store.backToMerchants(); }
       if (store.activeOrder && !ui.preview) ui.studentStep = 'status';
       if (!ui.preview) store.loadMyOrders(); // 进入即按本机手机号拉「我的订单」(状态以后端为准)
+      // 客户端进入即拉公开商家列表（在线模式 → 替换本地 seedState；离线 → 用本地 demo）
+      store.loadPublicVendors();
+      store.loadHubs(); // 拉社区共享楼栋池（地址簿/送达切换用）
       // 底部导航
       const showNav = computed(() => ui.studentTab !== 'home' || ui.studentStep === 'merchants');
       function goTab(t) { ui.studentTab = t; if (t === 'home' && ['orders', 'me'].indexOf(ui.studentStep) < 0 && !store.activeOrder) ui.studentStep = 'merchants'; }
@@ -138,15 +141,32 @@
     template: `
       <div class="m-list">
         <header class="home-hd">
-          <div class="home-hd__loc" @click="editAddr=true"><span class="home-hd__pin">📍</span><span class="home-hd__loc-t">{{ locText }}</span><span class="home-hd__loc-edit" v-if="store.profile">切换 ›</span></div>
-          <h1 class="home-hd__title">{{ hubName || '想吃点什么？' }}</h1>
+          <div class="home-hd__loc" @click="onLocClick"><span class="home-hd__pin">📍</span><span class="home-hd__loc-t">{{ hubName || '请选择社区' }}</span><span class="home-hd__loc-edit">切换 ›</span></div>
+          <h1 class="home-hd__title">{{ store.profile ? ('你好，' + store.profile.name) : '想吃点什么？' }}</h1>
         </header>
-        <div class="home-search">
+        <div class="home-search" v-if="store.currentHub">
           <span class="home-search__ic">🔍</span>
           <input v-model="q" placeholder="搜索商家或菜品" aria-label="搜索商家或菜品" />
           <button class="home-search__x" v-if="q" @click="q=''" aria-label="清除搜索">✕</button>
         </div>
-        <div class="home-sec"><span>{{ q ? '搜索结果' : '全部商家' }}</span><span class="home-sec__n">{{ filtered.length }}</span></div>
+        <div class="home-sec" v-if="store.currentHub"><span>{{ q ? '搜索结果' : '全部商家' }}</span><span class="home-sec__n">{{ filtered.length }}</span></div>
+
+        <!-- 首次访问 / 未选社区 → 弹选择器（强制选才能看商家） -->
+        <div class="modal" v-if="showHubPicker" @click.self="dismissPicker">
+          <div class="modal__panel hub-picker">
+            <div class="hub-picker__title">📍 你在哪个社区？</div>
+            <p class="hub-picker__sub">选了社区，才能看到附近的商家。可以随时点顶部切换。</p>
+            <div class="hub-picker__list">
+              <button class="hub-picker__item" v-for="h in store.state.hubs" :key="h.id" @click="pickHub(h.id)">
+                <span class="hub-picker__ico">🏫</span>
+                <span class="hub-picker__name">{{ h.name }}</span>
+                <span class="hub-picker__arrow">›</span>
+              </button>
+              <div v-if="!store.state.hubs.length" class="empty">还没有社区开通服务</div>
+            </div>
+          </div>
+        </div>
+
         <div class="modal" v-if="editAddr" @click.self="editAddr=false">
           <div class="modal__panel">
             <profile-form :buildings="store.hubBuildings(store.currentHub)" @done="editAddr=false"></profile-form>
@@ -189,18 +209,38 @@
         // 营业中的店排前面，休息/打烊的沉到底部（稳定排序，组内保持原顺序）——别让用户滑过一堆关着的店
         return base.slice().sort((a, b) => (store.isOpen(b) ? 1 : 0) - (store.isOpen(a) ? 1 : 0));
       });
-      const hubName = store.currentHubLabel();
+      const hubName = computed(() => store.currentHubLabel());
       const locText = computed(() => {
-        if (!store.profile) return hubName || '团团';
+        if (!store.profile) return hubName.value || '团团';
         var a = store.currentAddress();
-        return a ? ('送至 · ' + a.building + ' ' + a.room) : (hubName || '团团');
+        return a ? ('送至 · ' + a.building + ' ' + a.room) : (hubName.value || '团团');
+      });
+      // 社区选择器：未选社区 → 强制弹（除非系统里只 1 个社区，那自动选）
+      const _pickerDismissed = ref(false);
+      const showHubPicker = computed(() => {
+        if (store.currentHub) return false;
+        if (_pickerDismissed.value) return false;
+        return true;
+      });
+      function pickHub(id) { store.setCurrentHub(id); _pickerDismissed.value = false; }
+      function dismissPicker() { /* 必须选，禁止 dismiss */ }
+      function onLocClick() {
+        // 顶部 "切换" → 重新选社区
+        store.setCurrentHub('');
+        _pickerDismissed.value = false;
+      }
+      // 单社区系统：自动选，省一步
+      onMounted(function () {
+        if (!store.currentHub && store.state.hubs && store.state.hubs.length === 1) {
+          store.setCurrentHub(store.state.hubs[0].id);
+        }
       });
       function deliveryText(m) {
         if (!m.settings.deliveryOffered) return '仅自取';
         return m.settings.deliveryMode === 'fixed' ? '定时配送' : ('约 ' + m.settings.flexibleMin + '-' + m.settings.flexibleMax + ' 分钟');
       }
       function hasPromo(m) { return m.menu.some((it) => it.available && store.utils.hasDiscount(it)); }
-      return { store, q, editAddr, merchants, filtered, matchedDishes, hubName, locText, deliveryText, hasPromo };
+      return { store, q, editAddr, merchants, filtered, matchedDishes, hubName, locText, deliveryText, hasPromo, showHubPicker, pickHub, dismissPicker, onLocClick };
     },
   };
 
@@ -222,10 +262,10 @@
             <div class="order-card__top"><span class="order-card__id">{{ shopName(o.merchantId) }}</span><span class="chip" :class="st(o.status).cls">{{ st(o.status).label }}</span></div>
             <div class="order-card__cust">{{ items(o) }}</div>
             <div class="order-card__meta"><span>{{ store.utils.relTime(o.createdAt) }} · {{ o.id }}</span><span>{{ store.utils.rm(o.total) }}</span></div>
-            <div class="sync-note sync-note--go sm" v-if="o.syncStatus==='syncing'"><span class="spin spin--dark"></span> 同步中…</div>
-            <div class="sync-note sync-note--wait sm" v-else-if="o.syncStatus==='pending'">📶 离线重试中…</div>
-            <div class="sync-note sync-note--bad sm" v-else-if="o.syncStatus==='rejected'">❌ 下单未成功{{ o.syncError ? '：'+o.syncError : '' }}</div>
-            <div class="card-actions" v-if="o.imgStatus==='failed'" @click.stop><span class="img-sync__tag">❌ 截图超时</span><button class="btn btn--sm btn--primary" @click="store.retryOrderShot(o.id)">补传截图</button></div>
+            <div class="sync-note sync-note--go sm" v-if="o.syncStatus==='syncing'"><span class="spin spin--dark"></span> 正在发送给商家…</div>
+            <div class="sync-note sync-note--wait sm" v-else-if="o.syncStatus==='pending'">📶 网络有点慢，请刷新页面再试</div>
+            <div class="sync-note sync-note--bad sm" v-else-if="o.syncStatus==='rejected'">❌ 下单未成功，请刷新页面重试</div>
+            <div class="card-actions" v-if="o.imgStatus==='failed'" @click.stop><span class="img-sync__tag">⚠ 截图没传上</span><button class="btn btn--sm btn--primary" @click="store.retryOrderShot(o.id)">重新上传</button></div>
           </div>
         </template>
         <template v-if="past.length"><div class="cat-group__title">历史订单</div>
@@ -656,7 +696,7 @@
 
         <p class="error" v-if="error">{{ error }}</p>
         <div v-if="preview" class="preview-note">预览模式不可真正下单</div>
-        <button v-else class="btn btn--primary btn--block btn--pill" :disabled="closed || !screenshot" @click="submit">{{ closed ? '今日已截止' : (!screenshot ? '请先上传支付截图' : '提交订单') }}</button>
+        <button v-else class="btn btn--primary btn--block btn--pill" :disabled="closed || !screenshot || submitting" @click="submit">{{ submitting ? '提交中…' : (closed ? '今日已截止' : (!screenshot ? '请先上传支付截图' : '提交订单')) }}</button>
 
         <!-- 结算页直接改地址：点地址卡 → 底部弹出资料表单 -->
         <!-- 多地址切换器：单击当前地址卡时弹出，列出所有保存地址 + 跳"我的"管理 -->
@@ -710,21 +750,31 @@
       const closed = computed(() => mode.value === 'fixed' ? okSlots.value.length === 0 : nowMin() > toMin(props.merchant.settings.flexCloseTime || '23:59'));
       const chosenSlot = ref(okSlots.value[0] || '');
       function onFile(e) { const f = e.target.files && e.target.files[0]; if (!f) return; store.utils.compressImage(f).then((d) => (screenshot.value = d)).catch(() => {}); e.target.value = ''; }
-      function openTab(src) { try { const w = window.open('', '_blank'); if (w) { w.document.write('<title>收款码</title><body style="margin:0;background:#000;display:flex;align-items:center;justify-content:center;min-height:100vh"><img src="' + src + '" style="max-width:100%"></body>'); w.document.close(); } else { window.open(src, '_blank'); } } catch (e) { window.open(src, '_blank'); } }
+      function openTab(src) {
+        // H7 fix: use proper DOM API to prevent XSS via QR URL
+        var safeSrc = String(src || '');
+        // Only allow https: and data:image schemes
+        if (!/^(https:|data:image\/)/.test(safeSrc)) return;
+        try { const w = window.open('', '_blank'); if (w) { var img = w.document.createElement('img'); img.src = safeSrc; img.style.cssText = 'max-width:100%'; w.document.title = '收款码'; w.document.body.style.cssText = 'margin:0;background:#000;display:flex;align-items:center;justify-content:center;min-height:100vh'; w.document.body.appendChild(img); w.document.close(); } else { window.open(safeSrc, '_blank'); } } catch (e) { window.open(safeSrc, '_blank'); } }
+      // C4 fix: prevent double-submit with submitting guard
+      const submitting = ref(false);
       function submit() {
+        if (submitting.value) return;
         if (!props.lines.length) return (error.value = '购物车是空的');
         if (closed.value) return (error.value = '今日下单已截止');
         if (mode.value === 'fixed' && !slotOk(chosenSlot.value)) return (error.value = '请选择一个仍可下单的时间段');
         if (!screenshot.value) return (error.value = '请先上传支付成功截图才能提交');
         error.value = '';
+        submitting.value = true;
         const dt = mode.value === 'fixed' ? chosenSlot.value : `预计 ${props.merchant.settings.flexibleMin}-${props.merchant.settings.flexibleMax} 分钟`;
         const items = props.lines.map((l) => ({ id: l.itemId, name: l.name + (l.optionText ? '（' + l.optionText + '）' : ''), price: l.unit, qty: l.qty, options: l.optionText }));
         // 乐观先行：本地立即建单、0 阻塞，秒提示成功并跳详情；同步/传图全在后台
         store.placeOrder({ merchantId: props.merchant.id, items: items, deliveryTime: dt, deliveryMode: mode.value, screenshot: screenshot.value, remark: remark.value, redeemMembership: redeemMembership.value });
-        store.toastSuccess('🎉 下单成功！');
+        // H6 fix: show pending confirmation instead of premature success
+        store.toastSuccess('📤 订单已提交，正在确认…');
         emit('submitted');
       }
-      return { store, mode, chosenSlot, screenshot, error, qrIndex, b, remark, editingAddr, allowSampleShot, addresses, currentAddr, pickerOpen, slotOk, closed, onFile, openTab, submit, membershipEnabled, membershipBalance, membershipCanRedeem, membershipRedeemValue, membershipNeedPts, membershipPtsPerRM, redeemMembership, membershipDiscount, finalTotal };
+      return { store, mode, chosenSlot, screenshot, error, qrIndex, b, remark, editingAddr, allowSampleShot, addresses, currentAddr, pickerOpen, slotOk, closed, onFile, openTab, submit, submitting, membershipEnabled, membershipBalance, membershipCanRedeem, membershipRedeemValue, membershipNeedPts, membershipPtsPerRM, redeemMembership, membershipDiscount, finalTotal };
     },
   };
 
@@ -738,13 +788,13 @@
         <!-- 乐观下单：后端校验未通过（库存/截止/券）→ 整单未成，引导重下 -->
         <div class="card status-rejected" v-if="order.syncStatus==='rejected'">
           <div class="status-rejected__icon">❌</div><div class="status-rejected__title">下单未成功</div>
-          <div class="status-rejected__reason">{{ order.syncError || '订单未通过商家校验' }}</div>
+          <div class="status-rejected__reason">{{ order.syncError || '网络有点慢，请刷新页面再试' }}</div>
           <button class="btn btn--primary btn--pill" style="margin-top:14px" @click="$emit('neworder')">返回重新下单</button>
         </div>
         <template v-else>
         <!-- 乐观下单：后台同步状态（非阻塞，绝不弹中断式报错） -->
-        <div class="sync-note sync-note--go" v-if="order.syncStatus==='syncing'"><span class="spin spin--dark"></span> 正在同步到商家…</div>
-        <div class="sync-note sync-note--wait" v-else-if="order.syncStatus==='pending'">📶 网络不稳，正在后台自动重试同步…</div>
+        <div class="sync-note sync-note--go" v-if="order.syncStatus==='syncing'"><span class="spin spin--dark"></span> 正在发送给商家…</div>
+        <div class="sync-note sync-note--wait" v-else-if="order.syncStatus==='pending'">📶 网络有点慢，请刷新页面再试</div>
 
         <div class="card status-rejected" v-if="order.status === 'rejected'">
           <div class="status-rejected__icon">❌</div><div class="status-rejected__title">订单未通过</div>
@@ -770,6 +820,9 @@
           <div class="card delivered-card" v-if="order.status==='delivered' && order.deliveryPhoto">
             <div class="card__label">📸 您的餐已送达，请查收！</div><img class="delivery-photo" :src="order.deliveryPhoto" alt="" />
           </div>
+          <div class="card" v-else-if="order.status==='delivered' && order.imagesPurgedAt" style="background:#f0f9ff">
+            <div class="card__label" style="color:#0369a1">📄 订单已归档（30 天前完成，照片仅留 30 天，文字记录永久保留）</div>
+          </div>
           <p class="muted center sm" v-else>📲 进度实时更新，送达会立刻显示在这里，请留意本页。</p>
         </template>
 
@@ -782,10 +835,10 @@
         </div>
 
         <!-- 两阶段下单：支付截图后台同步状态 -->
-        <div class="card img-sync img-sync--wait" v-if="order.imgStatus==='uploading'"><span class="spin spin--dark"></span> 支付截图同步中…（订单已送达商家，无需等待）</div>
+        <div class="card img-sync img-sync--wait" v-if="order.imgStatus==='uploading'"><span class="spin spin--dark"></span> 支付截图上传中…（订单已发给商家，无需等待）</div>
         <div class="card img-sync img-sync--fail" v-else-if="order.imgStatus==='failed'">
-          <div class="img-sync__t">❌ 支付截图同步超时</div>
-          <p class="muted sm">网络可能不稳，商家暂时看不到你的付款凭证，请补传。</p>
+          <div class="img-sync__t">⚠ 支付截图没传上</div>
+          <p class="muted sm">网络有点慢，商家还没看到你的付款凭证，请补传。</p>
           <button class="btn btn--primary btn--pill img-sync__btn" @click="store.retryOrderShot(order.id)">一键补传截图</button>
         </div>
 
@@ -804,19 +857,23 @@
       const currentStep = computed(() => steps[ci.value]);
       const merchantName = computed(() => { const m = order.value && store.getMerchant(order.value.merchantId); return m ? m.name : ''; });
       function cancel() { if (order.value && window.confirm('确定取消这笔订单吗？')) store.cancelOrder(order.value.id); }
-      // v3: 自适应轮询 —— 根据后端返回的 pollIntervalMs 动态调整，终态停止
-      let timer = null; let polling = false; let currentInterval = 12000;
+      // v4: 自适应轮询 + 隐藏暂停 + 终态停止 —— 省 GAS 配额
+      //   后端 getOrder 按状态返 pollIntervalMs: pending 5s / cooking 15s / delivering 8s / 终态 0
+      //   tab 隐藏（锁屏/切 app）立即暂停 setInterval；可见再追一次重启
+      //   v3 之前只在 visible 时多 poll 一次但没在 hidden 时停 setInterval → 后台仍在烧 GAS
+      let timer = null; let polling = false; let currentInterval = 12000; let stopped = false;
       async function poll() {
-        const o = order.value; if (!o || polling || !(window.api && window.api.enabled())) return;
+        const o = order.value; if (!o || polling || stopped || !(window.api && window.api.enabled())) return;
+        if (document.visibilityState === 'hidden') return; // 后台不烧 GAS
         polling = true;
         try {
           const r = await window.api.getOrder(o.id);
           if (r && r.ok) {
             store.applyRemoteOrder(r.order);
-            // 后端可动态调整轮询间隔
             if (r.pollIntervalMs !== undefined) {
               if (r.pollIntervalMs === 0) {
-                // 终态：停止轮询
+                // 终态：彻底停轮询（stopped 防 visibilitychange 再启）
+                stopped = true;
                 if (timer) { clearInterval(timer); timer = null; }
                 polling = false; return;
               }
@@ -829,22 +886,29 @@
           }
         } catch (e) {} finally { polling = false; }
       }
-      // 切回前台立即拉一次：绕开手机浏览器对后台 setInterval 的节流(等餐时通常熄屏)，
-      // 否则商家改"已送达"/"已拒"后客户回前台要等到下一个被节流的 tick，体感"刷新很慢"
-      function onVisible() { if (document.visibilityState === 'visible') poll(); }
+      function onVisibilityChange() {
+        if (stopped) return; // 终态后不重启
+        if (document.visibilityState === 'visible') {
+          // 切回前台：立即拉一次（避开手机浏览器对后台 setInterval 的节流），重启 interval
+          poll();
+          if (!timer) timer = setInterval(poll, currentInterval);
+        } else {
+          // 切走：停 setInterval（in-flight 让它自然返回）
+          if (timer) { clearInterval(timer); timer = null; }
+        }
+      }
       onMounted(() => {
         if (window.api && window.api.enabled()) {
           var o = order.value;
-          // 已经是终态就不轮询了
-          if (o && ['delivered', 'rejected', 'cancelled'].indexOf(o.status) >= 0) return;
+          if (o && ['delivered', 'rejected', 'cancelled'].indexOf(o.status) >= 0) { stopped = true; return; }
           poll();
           timer = setInterval(poll, currentInterval);
-          document.addEventListener('visibilitychange', onVisible);
+          document.addEventListener('visibilitychange', onVisibilityChange);
         }
       });
       onUnmounted(() => {
         if (timer) { clearInterval(timer); timer = null; }
-        document.removeEventListener('visibilitychange', onVisible);
+        document.removeEventListener('visibilitychange', onVisibilityChange);
       });
       // WhatsApp 商家：仅商家在设置里填了 waNumber 才出现 wa.me 按钮
       // 状态相关的文案：客户主动找商家时常见原因

@@ -30,7 +30,7 @@
   window.SyncBar = {
     template: `
       <div class="sync-bar" v-if="store.syncError && store.failedSyncs.length">
-        <span>⚠ {{ store.failedSyncs.length }} 项未同步到云端</span>
+        <span>⚠ 网络有点慢，{{ store.failedSyncs.length }} 项未发送成功</span>
         <button @click="store.retrySync()" :disabled="store.syncBusy">{{ store.syncBusy ? '重试中…' : '点此重试' }}</button>
       </div>
     `,
@@ -138,9 +138,8 @@
           <div class="login__logo">{{ mode === 'admin' ? '🛠️' : '🛵' }}</div>
           <h1 class="login__title">{{ mode === 'admin' ? '内部管理后台' : '商家登录' }}</h1>
           <p class="login__sub">{{ mode === 'admin' ? '内部人员专用' : '商家入口 · 客户下单无需登录' }}</p>
-          <!-- 内部端：一键快速登入（管理员便捷入口）-->
-          <button v-if="mode === 'admin'" class="btn btn--primary btn--block btn--pill quick-login" :disabled="busy" @click="quick">⚡ 一键登入（管理员）</button>
-          <details class="login__manual" v-if="mode === 'admin'"><summary>用其它账号登录</summary>
+          <!-- admin 端：直接表单登录（用 PropertiesService 里设置的 ADMIN_USER/ADMIN_PASS） -->
+          <template v-if="mode === 'admin'">
             <label class="field"><span>账号</span><input v-model="username" placeholder="管理员账号" @keyup.enter="submit" /></label>
             <label class="field"><span>密码</span>
               <span class="pw-wrap">
@@ -148,9 +147,9 @@
                 <button type="button" class="pw-eye" @click="showPw = !showPw" :aria-label="showPw ? '隐藏密码' : '显示密码'">{{ showPw ? '🙈' : '👁' }}</button>
               </span>
             </label>
-            <button class="btn btn--ghost btn--block" :disabled="busy" @click="submit">{{ busy ? '登录中…' : '登录' }}</button>
-          </details>
-          <template v-if="mode !== 'admin'">
+            <button class="btn btn--primary btn--block" :disabled="busy" @click="submit"><span class="spin" v-if="busy"></span>{{ busy ? '登录中…' : '登录' }}</button>
+          </template>
+          <template v-else>
             <label class="field"><span>账号</span><input v-model="username" placeholder="商家账号" @keyup.enter="submit" /></label>
             <label class="field"><span>密码</span>
               <span class="pw-wrap">
@@ -189,7 +188,7 @@
             if (mode === 'admin') {
               const a = await window.api.adminLogin(u, password.value);
               if (a && a.ok) { store.setAuthUser({ username: u, role: 'admin', merchantId: null }, a.token); return; }
-              if (store.login(u, password.value) && store.auth.user.role === 'admin') return;
+              // 后端明确拒绝（返回 ok:false）→ 不本地兜底，避免「假登入」状态
               error.value = (a && a.error) || '账号或密码错误';
               return;
             }
@@ -200,11 +199,12 @@
               store.loadMerchantData(r.vendor.vendorId); // 后台并行加载，不阻塞登录
               return;
             }
-            if (store.login(u, password.value) && store.auth.user.role === 'merchant') return; // 本地兜底
+            // 后端明确拒绝 → 不本地兜底
             error.value = (r && r.error) || '账号或密码错误';
           } catch (e) {
-            if (store.login(u, password.value) && store.auth.user.role === mode) return; // 后端连不上时回退本地演示
-            error.value = '无法连接后端：' + e;
+            // 仅网络异常（fetch throw）才考虑本地兜底（?demo 用）
+            if (store.login(u, password.value) && store.auth.user.role === mode) return;
+            error.value = mode === 'admin' ? ('无法连接后端：' + e) : '网络有点慢，请刷新页面再试';
           } finally { busy.value = false; }
           return;
         }
@@ -214,9 +214,7 @@
         error.value = mode === 'admin' ? '管理员账号或密码错误' : '商家账号或密码错误';
       }
       function fill(u, p) { username.value = u; password.value = p; }
-      // 内部端一键登入：默认管理员账号直接进（在线则走 adminLogin，离线走本地）
-      async function quick() { username.value = 'admin'; password.value = (window.ADMIN_QUICK_PASS || 'admin123'); await submit(); }
-      return { mode, username, password, error, busy, showDemo, showPw, forgotUrl, submit, fill, quick };
+      return { mode, username, password, error, busy, showDemo, showPw, forgotUrl, submit, fill };
     },
   };
 })();

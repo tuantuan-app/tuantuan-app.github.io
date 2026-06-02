@@ -11,8 +11,10 @@
  * v3 既有：请求去重（同参数并发合并）+ 超时控制
  */
 (function () {
-  // 这 5 个读 action 由 Worker 缓存。其它（写、admin、auth）一律 GAS 直连
-  var CACHEABLE = { getOrder: 1, getVendorOrders: 1, getStorefront: 1, getOrdersByPhone: 1, listHubs: 1 };
+  // 这 6 个读 action 由 Worker 缓存。其它（写、admin、auth）一律 GAS 直连
+  // M22 fix: getMembership 进缓存白名单。客户查会员积分按 {vendorId, phone} 缓存
+  //   → 同 vendor+phone 30s 内重复查命中边缘，不烧 GAS（一笔订单结算页可能查 2-3 次）
+  var CACHEABLE = { getOrder: 1, getVendorOrders: 1, getStorefront: 1, getOrdersByPhone: 1, listHubs: 1, listPublicVendors: 1, getMembership: 1 };
 
 window.api = {
   base() { return (window.APP_CONFIG && window.APP_CONFIG.apiBase) || ''; },
@@ -74,6 +76,8 @@ window.api = {
   vendorLogin(username, password) { return this.post({ action: 'vendorLogin', username, password }, 15000); }, // 登录 15s 超时
   adminLogin(username, password) { return this.post({ action: 'adminLogin', username, password }); },
   listHubs() { return this.post({ action: 'listHubs' }); },
+  // 客户端首页：公开商家列表（已过滤 TEST + 已停业）
+  listPublicVendors() { return this._dedupe('lpv', function () { return window.api.post({ action: 'listPublicVendors' }); }); },
   getMembership(vendorId, phone) { return this.post({ action: 'getMembership', vendorId, phone }); },
   addHubBuilding(hubId, name, token) { return this.post({ action: 'addHubBuilding', hubId, name, token }); },
   removeHubBuilding(hubId, name, token) { return this.post({ action: 'removeHubBuilding', hubId, name, token }); },
@@ -100,6 +104,12 @@ window.api = {
   // 内部测试工具
   clearTestData(token) { return this.post({ action: 'clearTestData', token }); },
   resetSeedData(token) { return this.post({ action: 'resetSeedData', token }); },
+  // 老订单截图清理（Drive 配额保护）：删 N 天前订单的支付截图+送达照，仅留文字记录
+  purgeOldImages(days, token) { return this.post({ action: 'purgeOldImages', days: days || 30, token }, 60000); },
+  // 老订单归档（Sheet 10M cell 保护）：90+ 天终态订单从 Orders 搬到 OrdersArchive 表
+  archiveOldOrders(days, token) { return this.post({ action: 'archiveOldOrders', days: days || 90, token }, 120000); },
+  // 查归档（admin 任意；商家自动限到自己；客户传 phone）
+  getArchivedOrders(filter, token, limit, offset) { return this.post({ action: 'getArchivedOrders', filter, token, limit, offset }, 30000); },
   health(token) { return this.post({ action: 'health', token }, 15000); },
   // 系统配额监控：返回近 7 天每天调用数 + 总执行 ms + Sheet 行数 / cell 用量
   getSystemUsage(token) { return this.post({ action: 'getSystemUsage', token }, 15000); },
