@@ -4,7 +4,7 @@
  *  订单总览：跨所有商家的全部订单（只读监控）+ 统计
  */
 (function () {
-  const { computed, ref, reactive, onMounted } = Vue;
+  const { computed, ref, reactive, onMounted, onUnmounted } = Vue;
   const store = window.store;
 
   const STATUS_TEXT = {
@@ -97,8 +97,37 @@
       const loading = ref(false);
       const a = ref(store.analytics());
       function recompute() { a.value = store.analytics(); }
-      async function refresh() { loading.value = true; await store.refreshAdminData(); recompute(); loading.value = false; }
-      onMounted(refresh);
+      // silent===true：自动 poll 用。严格 === true，避免模板 @click="refresh" 把 Vue 的 click 事件当首参传进来（任何 truthy 都不可信）
+      async function refresh(silent) {
+        var isSilent = silent === true;
+        if (!isSilent) loading.value = true;
+        await store.refreshAdminData(); recompute();
+        if (!isSilent) loading.value = false;
+      }
+      // === 自动轮询（修复：之前 admin 必须手动点刷新才看到客户/商家最新动作）===
+      // 与客户/商家端的 setInterval 模式对齐：30s 起步 + visibilitychange 暂停/重启
+      // listAllOrders / listVendors 没在 Worker 边缘缓存白名单里 → 每次都打 GAS
+      //   单次 ~2-3s，30s 间隔 = 10% 占空比，可接受；admin 通常只开一两台
+      //   切到后台立即停 setInterval，回到前台立即拉一次 + 重启
+      let timer = null; let polling = false;
+      async function poll() {
+        if (polling || document.visibilityState === 'hidden') return;
+        polling = true;
+        try { await refresh(true); } catch (e) {} finally { polling = false; }
+      }
+      function onVisibility() {
+        if (document.visibilityState === 'visible') { poll(); if (!timer) timer = setInterval(poll, 30000); }
+        else if (timer) { clearInterval(timer); timer = null; }
+      }
+      onMounted(function () {
+        refresh(); // 首次走完整 loading 旋转，让用户看到反馈
+        timer = setInterval(poll, 30000);
+        document.addEventListener('visibilitychange', onVisibility);
+      });
+      onUnmounted(function () {
+        if (timer) { clearInterval(timer); timer = null; }
+        document.removeEventListener('visibilitychange', onVisibility);
+      });
 
       const orders = computed(() => a.value.orders);
       const vendors = computed(() => a.value.vendors);
@@ -145,8 +174,8 @@
         <div class="card">
           <div class="card__label">📍 新增社区/地区抬头</div>
           <div class="field-row">
-            <label class="field"><span>社区代码（网址 ?hub= 用，你自己定）</span><input v-model="form.id" placeholder="如：utm" /></label>
-            <label class="field"><span>抬头名称（客户看到的）</span><input v-model="form.name" placeholder="如：UTM 团团" /></label>
+            <label class="field"><span>社区代码（网址 ?hub= 用，你自己定）</span><input v-model="form.id" placeholder="社区代码" /></label>
+            <label class="field"><span>抬头名称（客户看到的）</span><input v-model="form.name" placeholder="社区名称" /></label>
           </div>
           <p class="error" v-if="error">{{ error }}</p>
           <button class="btn btn--primary btn--block" @click="add">添加社区</button>
@@ -165,7 +194,7 @@
               <span class="muted sm" v-if="!(h.buildings||[]).length">暂无楼栋</span>
             </div>
             <div class="cat-add" style="margin-top:6px">
-              <input :id="'bld-'+h.id" :ref="el => bldInputs[h.id]=el" :disabled="pending[h.id]" placeholder="添加楼栋，如：A 栋" @keyup.enter="addBld(h)" style="font-size:12px" />
+              <input :id="'bld-'+h.id" :ref="el => bldInputs[h.id]=el" :disabled="pending[h.id]" placeholder="添加楼栋" @keyup.enter="addBld(h)" style="font-size:12px" />
               <button class="btn btn--sm btn--primary" @click="addBld(h)" :disabled="pending[h.id]">{{ pending[h.id] ? '添加中…' : '＋ 添加' }}</button>
               <button class="btn btn--sm btn--ghost" @click="bulkBld(h)" :disabled="pending[h.id]" style="font-size:11px">📝 批量编辑</button>
             </div>
@@ -255,11 +284,11 @@
         <div class="modal" v-if="editing" @click.self="editing=null">
           <div class="modal__panel">
             <div class="modal__head"><span>{{ isNew ? '注册新商家' : '编辑商家' }}</span><button class="link-btn" @click="editing=null">关闭</button></div>
-            <label class="field"><span>店名</span><input v-model="form.name" placeholder="例如：阿强快餐" /></label>
-            <label class="field"><span>简介</span><input v-model="form.desc" placeholder="例如：中式快餐 · 米饭面食" /></label>
+            <label class="field"><span>店名</span><input v-model="form.name" placeholder="店名" /></label>
+            <label class="field"><span>简介</span><input v-model="form.desc" placeholder="简介" /></label>
             <div class="field-row">
               <label class="field"><span>图标 Emoji</span><input v-model="form.logo" maxlength="2" placeholder="🍛" /></label>
-              <label class="field"><span>TNG 收款名</span><input v-model="form.tngLabel" placeholder="Ah Keong Food" /></label>
+              <label class="field"><span>TNG 收款名</span><input v-model="form.tngLabel" placeholder="TNG 收款人名" /></label>
             </div>
             <label class="field"><span>所属社区</span>
               <select class="reject-select" v-model="form.hubId">
@@ -270,7 +299,7 @@
             <div class="cred-box">
               <div class="card__label">🔑 商家登录账号</div>
               <div class="field-row">
-                <label class="field"><span>账号</span><input v-model="form.username" :disabled="!isNew" placeholder="如 shop4" /></label>
+                <label class="field"><span>账号</span><input v-model="form.username" :disabled="!isNew" placeholder="登录账号" /></label>
                 <label class="field"><span>密码</span>
                   <span class="pw-wrap">
                     <input v-model="form.password" :type="showPw ? 'text' : 'password'" :placeholder="isNew ? '设置初始密码' : '留空 = 不改 / 填新 = 重置'" />
@@ -420,7 +449,7 @@
               <div class="card__label">记一笔收款（续费）</div>
               <div class="field-row">
                 <label class="field"><span>金额 RM</span><input type="number" v-model.number="form.amount" min="0" step="0.01" /></label>
-                <label class="field"><span>备注</span><input v-model="form.note" placeholder="如：5月续费 / TNG" /></label>
+                <label class="field"><span>备注</span><input v-model="form.note" placeholder="备注" /></label>
               </div>
               <p class="muted sm">「收款并续费」会记一笔账，并把套餐设为专业版、到期日设为上面的日期。</p>
             </div>
@@ -457,8 +486,32 @@
         store.toastSuccess('套餐已更新 · ' + editing.value.name);
         editing.value = null;
       }
-      async function refresh() { loading.value = true; await store.refreshAdminData(); await store.loadPayments(); loading.value = false; }
-      onMounted(refresh);
+      async function refresh(silent) {
+        var isSilent = silent === true;
+        if (!isSilent) loading.value = true;
+        await store.refreshAdminData(); await store.loadPayments();
+        if (!isSilent) loading.value = false;
+      }
+      // 同 AdminDashboard：30s 自动 poll + visibility 暂停。否则商家续费/payments 进账后看板不动
+      let timer = null; let polling = false;
+      async function poll() {
+        if (polling || document.visibilityState === 'hidden') return;
+        polling = true;
+        try { await refresh(true); } catch (e) {} finally { polling = false; }
+      }
+      function onVisibility() {
+        if (document.visibilityState === 'visible') { poll(); if (!timer) timer = setInterval(poll, 30000); }
+        else if (timer) { clearInterval(timer); timer = null; }
+      }
+      onMounted(function () {
+        refresh();
+        timer = setInterval(poll, 30000);
+        document.addEventListener('visibilitychange', onVisibility);
+      });
+      onUnmounted(function () {
+        if (timer) { clearInterval(timer); timer = null; }
+        document.removeEventListener('visibilitychange', onVisibility);
+      });
       return { store, loading, editing, error, form, sum, rows, payments, shopName, open, renew, pay, saveOnly, refresh };
     },
   };

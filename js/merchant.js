@@ -59,6 +59,31 @@
         var ringOn = store.merchant && store.merchant.settings && store.merchant.settings.ring && store.merchant.settings.ring.enabled;
         if (fresh && store.merchant && store.merchant.settings.soundOn !== false && !ringOn) store.utils.playAlert();
       });
+
+      // === 常驻新单轮询（修复漏单）===
+      // MOrders（订单 tab）卸载后它自带的轮询会停，商家停在「商品/设置/会员/统计」tab 时
+      // 就不再拉单 → 新订单不进店、响铃不响、角标不动 → 漏单。
+      // 这里在 MerchantApp（登录期间始终挂载）加一个常驻轮询：只在「非订单 tab」时拉，
+      // 避免与 MOrders 自身轮询重复；切后台暂停、回前台立刻补一次。响铃/角标都靠 applyVendorOrders 驱动。
+      let bgTimer = null; let bgPolling = false;
+      async function bgPoll() {
+        if (bgPolling || tab.value === 'orders') return;        // 订单 tab 交给 MOrders，自己不重复打
+        if (document.visibilityState === 'hidden') return;      // 后台不烧后端
+        if (!(window.api && window.api.enabled())) return;       // demo/离线无后端可拉
+        bgPolling = true;
+        try { await store.refreshVendorOrders(ui.merchantId); } catch (e) {} finally { bgPolling = false; }
+      }
+      function onBgVisibility() { if (document.visibilityState === 'visible') bgPoll(); }
+      // 切到非订单 tab 时立刻补拉一次，别等下一个 interval（最坏 ~10s 才发现新单）
+      watch(tab, function (t) { if (t !== 'orders') bgPoll(); });
+      onMounted(function () {
+        bgTimer = setInterval(bgPoll, 10000);                   // 10s：商家在别的 tab 操作时也能秒级感知新单
+        document.addEventListener('visibilitychange', onBgVisibility);
+      });
+      onUnmounted(function () {
+        if (bgTimer) { clearInterval(bgTimer); bgTimer = null; }
+        document.removeEventListener('visibilitychange', onBgVisibility);
+      });
       return { store, ui, tab, pro, pendingCount };
     },
   };
@@ -423,7 +448,7 @@
               <button class="cat-chip__x" v-if="store.merchant.categories.length>1" @click="delCat(c)">×</button>
             </span>
           </div>
-          <div class="cat-add"><input v-model="newCat" placeholder="自定义分类，如：套餐 / 甜品" @keyup.enter="addCat" /><button class="btn btn--sm btn--primary" @click="addCat">添加</button></div>
+          <div class="cat-add"><input v-model="newCat" placeholder="分类名称" @keyup.enter="addCat" /><button class="btn btn--sm btn--primary" @click="addCat">添加</button></div>
         </div>
 
         <div class="skel-list" v-if="store.ui.merchantMenuLoading && !store.merchant.menu.length">
@@ -469,7 +494,7 @@
         <div class="modal" v-if="emojiFor" @click.self="emojiFor=null">
           <div class="modal__panel">
             <div class="modal__head"><span>选择图标</span><button class="link-btn" @click="emojiFor=null">关闭</button></div>
-            <input class="emoji-search" v-model="emojiQ" placeholder="搜索：鸡 / 饭 / 面 / 奶茶 / 甜品 / chicken …" />
+            <input class="emoji-search" v-model="emojiQ" placeholder="搜索 emoji" />
             <div class="emoji-grid">
               <button class="emoji-cell" v-for="x in filteredEmojis" :key="x.e" @click="chooseEmoji(x.e)">{{ x.e }}</button>
             </div>
@@ -486,7 +511,7 @@
               <label class="fee-toggle"><input type="checkbox" v-model="draft.discount.enabled" /><span>开启折扣</span></label>
               <div class="cfg-row" v-if="draft.discount.enabled">
                 <select class="cat-select" v-model="draft.discount.type"><option value="percent">按百分比 %</option><option value="fixed">直接减 RM</option></select>
-                <input class="num-in" type="number" min="0" v-model.number="draft.discount.value" :placeholder="draft.discount.type==='percent'?'如 20':'如 1.5'" />
+                <input class="num-in" type="number" min="0" v-model.number="draft.discount.value" :placeholder="draft.discount.type==='percent'?'折扣 %':'减免金额'" />
                 <span class="muted sm">{{ draft.discount.type==='percent' ? '%' : 'RM' }}</span>
               </div>
             </div>
@@ -616,7 +641,7 @@
             </label>
           </div>
           <p class="muted sm" v-else>本社区暂无楼栋，添加第一个 👇</p>
-          <div class="cat-add"><input v-model="newBld" placeholder="添加楼栋，如：A 栋 / 宿舍 3 座" @keyup.enter="addBld" /><button class="btn btn--sm btn--primary" @click="addBld">添加</button></div>
+          <div class="cat-add"><input v-model="newBld" placeholder="添加楼栋" @keyup.enter="addBld" /><button class="btn btn--sm btn--primary" @click="addBld">添加</button></div>
         </div>
 
         <!-- 新单响铃（Web Audio · 零素材） -->
@@ -658,7 +683,7 @@
           <div class="card__label">💬 客户 WhatsApp 联系号 <span class="muted sm">客户在订单页可一键 wa.me 找你</span></div>
           <div class="ring-row">
             <span>WhatsApp 号</span>
-            <input type="tel" inputmode="numeric" maxlength="20" v-model="store.merchant.settings.waNumber" @blur="normalizeWa" placeholder="例：0123456789（大马号自动加 60）" style="flex:1;min-width:160px;padding:6px 8px;border:1px solid var(--line,#e5e7eb);border-radius:6px" />
+            <input type="tel" inputmode="numeric" maxlength="20" v-model="store.merchant.settings.waNumber" @blur="normalizeWa" placeholder="0123456789" style="flex:1;min-width:160px;padding:6px 8px;border:1px solid var(--line,#e5e7eb);border-radius:6px" />
           </div>
           <p class="muted sm" v-if="waPreview.ok" style="color:var(--green-d)">✓ 客户将看到：<b>{{ waPreview.display }}</b> · 点击跳 <code style="font-size:11px">wa.me/{{ waPreview.intl }}</code></p>
           <p class="muted sm" v-else-if="store.merchant.settings.waNumber" style="color:#d97706">⚠ {{ waPreview.err }}（{{ waPreview.digits }} 位）— 客户点击不会跳转</p>
@@ -730,7 +755,7 @@
           try { store.toastError && store.toastError('请先点击页面任意位置，再点试听'); } catch (_) {}
         }
       }
-      function onQR(e) { pickImage(e, (d) => { const label = window.prompt('给这个收款码起个名字：', "Touch 'n Go") || '收款码'; store.addPayQR(store.merchant.id, label, d); }); }
+      function onQR(e) { pickImage(e, (d) => { const label = window.prompt('给这个收款码起个名字（如：TNG / DuitNow）：', '') || '收款码'; store.addPayQR(store.merchant.id, label, d); }); }
       function delQR(q) { if (window.confirm('删除收款码「' + q.label + '」？')) store.removePayQR(store.merchant.id, q.id); }
       const newBld = ref('');
       function addBld() { var n = (newBld.value || '').trim(); if (n) { store.addBuildingToHub(store.merchant.id, n); newBld.value = ''; } }

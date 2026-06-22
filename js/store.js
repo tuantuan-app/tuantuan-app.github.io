@@ -471,6 +471,19 @@
   }
 
   const state = reactive(loadState());
+  // 客户端 + 在线 + 首次访问（无持久化）：loadState() 返回的是 seed 演示商家（shop1/2/3，
+  // 如「阿强快餐」），这些 vendorId 在真实后端并不存在。冷加载期间（loadPublicVendors
+  // 拉真数据前 ~3-8s）首页会把这些幽灵店铺画出来，用户点进去 getStorefront 404 → 空白菜单。
+  // 这里在客户端在线首访时清掉 seed 商家，让首页显示「加载中…」直到真数据到位。
+  //   - demo 模式（api 未启用）：保留 seed 演示商家
+  //   - 回访用户（已持久化真实商家）：不清，保留「秒显上次商家」体验，loadPublicVendors 再刷新
+  //   - 仅限 APP_MODE==='customer'：不影响商家/admin 端首访
+  try {
+    if (window.APP_MODE === 'customer' && window.api && window.api.enabled()
+        && !localStorage.getItem(STORAGE_KEY) && Array.isArray(state.merchants)) {
+      state.merchants = [];
+    }
+  } catch (e) {}
   // 乐观下单：上次会话被打断的中间态，重载后归一——"上传中"图视为失败(可补传)，"同步中"文字回退到 pending(待续传)
   if (Array.isArray(state.orders)) state.orders.forEach(function (o) {
     // 重开页面时上次会话的"传图中/慢"状态都视为待续传(resumePendingSyncs 会重启)；
@@ -494,6 +507,9 @@
     // 客户端首页冷加载状态：未 true 时不显示「本社区暂未开通商家」，避免在 API 返回前
     // 闪现空状态。loadPublicVendors() 完成（成功/失败）后置 true。
     publicVendorsLoaded: false,
+    // 公开商家列表「上次加载是否网络失败」：true + 列表为空 → 首页显示「网络不太好，正在重试…」
+    // 而不是误导性的「本社区暂未开通商家」。成功一次即清回 false。
+    publicVendorsError: false,
   });
   const _auth = loadAuth() || {};
   // 在线模式下：localStorage 里没 token = 上次「假登入」残留 → 视为未登录
@@ -591,8 +607,11 @@
           var merged = fresh.slice();
           kept.forEach(function (m) { if (!merged.find(function (x) { return x.id === m.id; })) merged.push(m); });
           state.merchants = merged;
+          ui.publicVendorsError = false; // 成功拉到 → 清网络错误标记
+        } else {
+          ui.publicVendorsError = true; // 后端返回异常（非 ok）
         }
-      } catch (e) {}
+      } catch (e) { ui.publicVendorsError = true; } // 断网/超时
       finally { ui.publicVendorsLoaded = true; }
     },
     hubBuildings(hubId) { var h = state.hubs.find(function (x) { return x.id === hubId; }); return (h && h.buildings) || []; },
@@ -796,6 +815,23 @@
         .then(function (r) { if (r && r.ok) { self.applyVendorOrders(id, r.orders); if (r.pollIntervalMs) self.pollIntervalMs = r.pollIntervalMs; } })
         .catch(function () { self._merchantDataLoaded[id] = false; })
         .then(function () { ui.merchantOrdersLoading = false; });
+    },
+
+    // 商家订单刷新（供 MerchantApp 顶层常驻轮询 + MOrders 列表轮询共用）
+    //   关键：拉单 → applyVendorOrders（内部驱动响铃 start/stop + 更新 pendingCount/badge）。
+    //   只要这个方法在跑，商家无论停在哪个 tab（商品/设置/会员/统计）都不会漏新单。
+    //   返回后端建议的 pollIntervalMs，调用方据此自适应调节频率。
+    async refreshVendorOrders(id) {
+      if (!id || !(window.api && window.api.enabled()) || !auth.token) return null;
+      try {
+        var r = await window.api.getVendorOrders(id, auth.token);
+        if (r && r.ok) {
+          this.applyVendorOrders(id, r.orders);
+          if (r.pollIntervalMs) this.pollIntervalMs = r.pollIntervalMs;
+          return r.pollIntervalMs || this.pollIntervalMs;
+        }
+      } catch (e) {}
+      return null;
     },
 
     // ---- v3: 下拉刷新（带去重） ----
@@ -1022,16 +1058,45 @@
       } catch (e) { ui.myOrdersError = true; }
       finally { ui.myOrdersRefreshing = false; }
     },
-    cancelOrder(id) {
+    // 取消订单 —— 这是唯一一个「后端会合法否决」的客户操作：客户点取消的同一刻，
+    // 商家可能正好接单，后端 cancelOrder_ 对非 pending 单返回 {ok:false}。
+    // 旧版先把本地乐观置 'cancelled'（终态）再 fire-and-forget sync_，一旦后端否决：
+    //   (1) 乐观终态永不回滚；
+    //   (2) 'cancelled' 是终态 → _acceptRemoteStatus 会挡掉之后所有 cooking/delivering/
+    //       delivered 远端状态 → 客户永远停在「已取消」，商家照做照送 → 严重对账分歧，
+    //       唯一反馈还是误导性的「网络有点慢，请刷新页面再试」。
+    // 修法：在线时直接 await 取消请求，按后端结果决定本地状态——只有后端确认才置终态；
+    //       被否决则拉回真实状态并诚实提示；网络失败则不动状态、提示重试。
+    async cancelOrder(id) {
       var o = this.getOrder(id);
-      if (o && o.status === 'pending') {
+      if (!(o && o.status === 'pending')) return;
+      if (o._cancelling) return; // 防连点重复提交
+      var self = this;
+      function _commitCancelled() {
         o.status = 'cancelled'; o._localMutAt = Date.now();
-        // Bug 2 fix: the "📤 订单已提交，正在确认…" toast (3.5s) is misleading once
-        // the user has cancelled — it still says "正在确认" while the order is gone.
-        // Drop any lingering toast on cancel so the cancelled state speaks for itself.
+        // 取消后丢掉残留的「📤 订单已提交，正在确认…」toast —— 它会一边说「正在确认」
+        // 一边订单已经没了，误导客户。让「已取消」状态自己说话。
         if (toast.visible) { toast.visible = false; if (_toastTimer) { clearTimeout(_toastTimer); _toastTimer = null; } }
-        this.sync_({ action: 'cancelOrder', orderId: id });
-        this.toastSuccess('订单已取消');
+        self.toastSuccess('订单已取消');
+      }
+      // 离线 / 本地 demo（无后端可否决）：保持原乐观行为
+      if (!(window.api && window.api.enabled())) { _commitCancelled(); return; }
+      o._cancelling = true;
+      this.showToast('正在取消…', 'info');
+      try {
+        var r = await window.api.cancelOrder(id);
+        if (r && r.ok) {
+          _commitCancelled();
+        } else {
+          // 后端否决 —— 商家已接单/已处理。拉回真实状态，给客户诚实提示，不留「假取消」
+          this.toastError((r && r.error) || '商家已在处理这笔订单，无法取消');
+          await this.loadMyOrders();
+        }
+      } catch (e) {
+        // 网络/超时 —— 没改成任何状态，提示客户重试（不要留下「以为取消了」的错觉）
+        this.toastError('网络有点慢，取消没成功，请重试');
+      } finally {
+        o._cancelling = false;
       }
     },
 
@@ -1066,6 +1131,9 @@
       }
       this._persistProfile();
       this.loadMyOrders(); // 换号/首次填号后，拉该手机名下的订单
+      // 通知 main.js Web Push 重新尝试 enable：客户首次填手机/换号后才有 identity
+      // —— 解决 Codex 发现：setTimeout(_silentEnableIfGranted, 1500) 在 profile 创建前就跑过了
+      try { window.dispatchEvent(new CustomEvent('notify:resubscribe')); } catch (_) {}
     },
     clearProfile() { this.profile = null; ui.selectedAddrId = null; localStorage.removeItem(PROFILE_KEY); },
     _persistProfile() { if (this.profile) localStorage.setItem(PROFILE_KEY, JSON.stringify(this.profile)); },

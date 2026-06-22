@@ -66,7 +66,7 @@
             <div class="modal__head"><span>📱 欢迎回到团团</span><button class="link-btn" @click="pwaDismiss">稍后</button></div>
             <p class="muted sm" style="margin:6px 0 12px">首次在桌面 App 打开？输入你之前下单用的手机号，自动恢复历史订单和地址。</p>
             <label class="field field--phone"><span>手机号</span>
-              <div class="phone-input"><span class="phone-input__cc">🇲🇾 +60</span><input v-model="pwaPhone" type="tel" inputmode="numeric" placeholder="12-345 6789（或 0123456789）" maxlength="20" /></div>
+              <div class="phone-input"><span class="phone-input__cc">🇲🇾 +60</span><input v-model="pwaPhone" type="tel" inputmode="numeric" placeholder="12-345 6789" maxlength="20" /></div>
             </label>
             <p class="error" v-if="pwaErr">{{ pwaErr }}</p>
             <button class="btn btn--primary btn--block" :disabled="pwaSubmitting" @click="pwaSubmit">{{ pwaSubmitting ? '正在恢复…' : '恢复' }}</button>
@@ -150,6 +150,50 @@
         }, 150);
       }
       const liveCount = computed(() => store.profile ? store.state.orders.filter((o) => o.customer && o.customer.phone === store.profile.phone && ['pending', 'cooking', 'delivering'].indexOf(o.status) >= 0).length : 0);
+
+      // === 常驻订单状态轮询（修复：客户在首页/菜单/结算页浏览时，已下单的状态变化看不到）===
+      // 订单 tab 自己有 15s 轮询、订单详情页有自适应轮询；但客户停在「首页」逛别的店时，
+      // 之前没有任何东西刷新订单状态 → 角标 liveCount 不动、商家接单/拒单/送达感知不到。
+      // 这里在 StudentApp（客户端在线期间常驻）加一个 20s 轮询：仅在「非订单 tab」时拉，
+      // 避免与订单 tab 自身轮询重复；切后台暂停、回前台立即补一次。
+      let myTimer = null; let myPolling = false;
+      async function myPoll() {
+        if (myPolling || ui.studentTab === 'orders') return;     // 订单 tab 交给 CustomerOrders 自身轮询
+        if (document.visibilityState === 'hidden') return;
+        if (ui.preview) return;                                   // admin 预览态不拉
+        if (!(store.profile && store.profile.phone)) return;      // 没手机号无从查起
+        if (!liveCount.value) return;                             // 省后端：没有进行中订单就不轮询（终态/无单的客户不打后端）
+        myPolling = true;
+        try { await store.loadMyOrders(); } catch (e) {} finally { myPolling = false; }
+      }
+      function onMyVisibility() { if (document.visibilityState === 'visible') myPoll(); }
+
+      // === 店内菜单页自动刷新（修复：客户看菜单时，售罄/库存/涨价/打烊看不到）===
+      // 之前菜单只有「下拉」才刷新 → 客户照旧菜单点了已售罄的菜，下单才被拒。
+      // 停在某家店菜单（studentStep==='menu'）时每 30s 静默刷新该店 storefront（边缘缓存兜底，压力可控）。
+      let sfTimer = null; let sfPolling = false;
+      async function sfPoll() {
+        if (sfPolling || ui.studentStep !== 'menu' || !ui.studentMerchantId) return;
+        if (document.visibilityState === 'hidden') return;
+        if (!(window.api && window.api.enabled())) return;
+        sfPolling = true;
+        try { await store.refreshStorefront(ui.studentMerchantId); } catch (e) {} finally { sfPolling = false; }
+      }
+      function onSfVisibility() { if (document.visibilityState === 'visible') sfPoll(); }
+
+      onMounted(function () {
+        myTimer = setInterval(myPoll, 20000);
+        sfTimer = setInterval(sfPoll, 30000);
+        document.addEventListener('visibilitychange', onMyVisibility);
+        document.addEventListener('visibilitychange', onSfVisibility);
+      });
+      onUnmounted(function () {
+        if (myTimer) { clearInterval(myTimer); myTimer = null; }
+        if (sfTimer) { clearInterval(sfTimer); sfTimer = null; }
+        document.removeEventListener('visibilitychange', onMyVisibility);
+        document.removeEventListener('visibilitychange', onSfVisibility);
+      });
+
       // 下拉刷新菜单
       const pullDist = ref(0); const pullArea = ref(null); let startY = null;
       function ptrStart(e) { startY = (window.scrollY <= 0) ? e.touches[0].clientY : null; pullDist.value = 0; }
@@ -276,6 +320,7 @@
         <div class="shop-cards">
           <!-- 加载未完成时显示一行轻量提示，避免闪现"暂未开通"（cold load 上 API ~3-5s） -->
           <div class="empty" v-if="!filtered.length && !store.ui.publicVendorsLoaded && !q"><span class="spin spin--dark"></span> 加载中…</div>
+          <div class="empty" v-else-if="!filtered.length && store.ui.publicVendorsError && !q"><span class="spin spin--dark"></span> 网络不太好，正在重试…</div>
           <div class="empty" v-else-if="!filtered.length">{{ q ? '没有找到匹配的商家或菜品 🔍' : '本社区暂未开通商家' }}</div>
           <div class="shop-card" :class="{ 'shop-card--closed': !store.isOpen(m) }" v-for="m in filtered" :key="m.id" @click="store.openMerchant(m.id)">
             <div class="shop-card__logo">{{ m.logo }}</div>
@@ -341,10 +386,34 @@
         _pickerDismissed.value = false;
       }
       // 单社区系统：自动选，省一步
+      // 首页商家列表 60s 自动 poll —— 让营业状态/新店上架在 1 分钟内可见
+      // 与 Worker listPublicVendors 边缘缓存 TTL=30s 对齐：用户侧最坏体验 ≤ 60s + 30s
+      // 走 visibilitychange 暂停后台 tab，避免无谓后端压力
+      var listTimer = null;
+      var listPolling = false;
+      async function pollList() {
+        if (listPolling || document.visibilityState === 'hidden') return;
+        listPolling = true;
+        try { await store.loadPublicVendors(); } catch (e) {} finally { listPolling = false; }
+      }
+      function onListVisibility() {
+        if (document.visibilityState === 'visible') {
+          pollList();
+          if (!listTimer) listTimer = setInterval(pollList, 60000);
+        } else if (listTimer) {
+          clearInterval(listTimer); listTimer = null;
+        }
+      }
       onMounted(function () {
         if (!store.currentHub && store.state.hubs && store.state.hubs.length === 1) {
           store.setCurrentHub(store.state.hubs[0].id);
         }
+        listTimer = setInterval(pollList, 60000);
+        document.addEventListener('visibilitychange', onListVisibility);
+      });
+      onUnmounted(function () {
+        if (listTimer) { clearInterval(listTimer); listTimer = null; }
+        document.removeEventListener('visibilitychange', onListVisibility);
       });
       function deliveryText(m) {
         if (!m.settings.deliveryOffered) return '仅自取';
@@ -399,11 +468,23 @@
       function items(o) { return (o.items || []).map(function (i) { return i.name + '×' + i.qty; }).join('，'); }
       function st(s) { return ORDER_STATUS[s] || { label: s, cls: '' }; }
       function onVisible() { if (document.visibilityState === 'visible') store.loadMyOrders(); }
+      // 自动轮询：停留在「订单」tab 时也要看到商家接单/送达。15s 与后端 getOrdersByPhone
+      // 的 pollIntervalMs=12000 对齐 + 边缘缓存 15s TTL，多端轮询会被合并到边缘，GAS 压力可控
+      let listTimer = null; let listPolling = false;
+      async function pollList() {
+        if (listPolling || document.visibilityState === 'hidden') return;
+        listPolling = true;
+        try { await store.loadMyOrders(); } catch (e) {} finally { listPolling = false; }
+      }
       onMounted(function () {
         store.loadMyOrders(); // 打开「订单」即刷新，商家改的状态(取消/拒绝/送达)同步过来
+        listTimer = setInterval(pollList, 15000);
         document.addEventListener('visibilitychange', onVisible); // 回前台再刷一次，避免列表停留在过时状态
       });
-      onUnmounted(function () { document.removeEventListener('visibilitychange', onVisible); });
+      onUnmounted(function () {
+        if (listTimer) { clearInterval(listTimer); listTimer = null; }
+        document.removeEventListener('visibilitychange', onVisible);
+      });
       return { store, orders, active, past, shopName, items, st };
     },
   };
@@ -446,9 +527,9 @@
         <div class="modal" v-if="addrModal==='add'" @click.self="addrModal=''">
           <div class="modal__panel">
             <div class="modal__head"><span>新增地址</span><button class="link-btn" @click="addrModal=''">关闭</button></div>
-            <label class="field"><span>标签</span><input v-model="addrDraft.label" placeholder="如：家 / 办公室 / 朋友家" maxlength="20" /></label>
-            <label class="field"><span>楼栋</span><input v-model="addrDraft.building" placeholder="如：A 栋 / 宿舍 1 座" maxlength="60" /></label>
-            <label class="field"><span>标记点</span><input v-model="addrDraft.room" placeholder="如：506 / B12 柜" maxlength="30" /></label>
+            <label class="field"><span>标签</span><input v-model="addrDraft.label" placeholder="地址标签" maxlength="20" /></label>
+            <label class="field"><span>楼栋</span><input v-model="addrDraft.building" placeholder="楼栋" maxlength="60" /></label>
+            <label class="field"><span>标记点</span><input v-model="addrDraft.room" placeholder="房号 / 标记点" maxlength="30" /></label>
             <p class="error" v-if="addrErr">{{ addrErr }}</p>
             <button class="btn btn--primary btn--block" @click="saveAdd">保存</button>
           </div>
@@ -503,9 +584,9 @@
       <div class="card form-card">
         <h2 class="form-title">填写收货资料</h2>
         <p class="form-note">只需填一次，本机自动记住，下次免登录直接下单。</p>
-        <label class="field"><span>姓名</span><input v-model="form.name" placeholder="例如：陈小明" maxlength="60" /></label>
+        <label class="field"><span>姓名</span><input v-model="form.name" placeholder="姓名" maxlength="60" /></label>
         <label class="field field--phone"><span>手机号</span>
-          <div class="phone-input"><span class="phone-input__cc">🇲🇾 +60</span><input v-model="form.phone" @blur="normalizePhone" type="tel" inputmode="numeric" placeholder="例如：12-345 6789（或 0123456789）" maxlength="20" /></div>
+          <div class="phone-input"><span class="phone-input__cc">🇲🇾 +60</span><input v-model="form.phone" @blur="normalizePhone" type="tel" inputmode="numeric" placeholder="12-345 6789" maxlength="20" /></div>
         </label>
         <p class="muted sm field-hint" v-if="phonePreview.ok" style="margin-top:-6px;color:var(--green-d)">✓ 将存为 <b>{{ phonePreview.display }}</b></p>
         <p class="muted sm field-hint" v-else-if="form.phone" style="margin-top:-6px;color:#d97706">⚠ {{ phonePreview.err }}（{{ phonePreview.digits }} 位）</p>
@@ -516,10 +597,10 @@
               <option v-for="b in buildings" :key="b" :value="b">{{ b }}</option>
               <option value="__other__">其他（手填）</option>
             </select>
-            <input v-if="!(buildings && buildings.length)" v-model="form.building" placeholder="如：A 栋 / 3 号楼" maxlength="60" />
+            <input v-if="!(buildings && buildings.length)" v-model="form.building" placeholder="楼栋" maxlength="60" />
             <input v-if="(buildings && buildings.length) && form.building==='__other__'" v-model="otherBld" class="field-extra" placeholder="手填配送楼栋" maxlength="60" />
           </label>
-          <label class="field"><span>标记点（选填）</span><input v-model="form.room" placeholder="如：506 / B12 柜" maxlength="30" /></label>
+          <label class="field"><span>标记点（选填）</span><input v-model="form.room" placeholder="房号 / 标记点" maxlength="30" /></label>
         </div>
         <p class="error" v-if="error">{{ error }}</p>
         <!-- PDPA 同意（仅首次填资料时显示，0 友情绑架的最小负担）-->
@@ -830,7 +911,7 @@
           <p class="muted sm" v-else>暂无团团豆，下单后自动积豆。</p>
         </div>
 
-        <div class="card" v-if="merchant.settings && merchant.settings.allowRemark !== false"><div class="card__label">📝 备注（选填）</div><input class="remark-in" v-model="remark" maxlength="60" placeholder="如：少辣、不要葱、放门口" /></div>
+        <div class="card" v-if="merchant.settings && merchant.settings.allowRemark !== false"><div class="card__label">📝 备注（选填）</div><input class="remark-in" v-model="remark" maxlength="60" placeholder="备注" /></div>
 
         <div class="card pay-card">
           <div class="card__label">💳 第一步：扫码付款 {{ store.utils.rm(finalTotal) }}</div>
@@ -1011,7 +1092,7 @@
         <!-- 联系商家 WhatsApp（仅商家配置了 waNumber 时显示） -->
         <a class="btn btn--block btn--pill contact-wa" v-if="merchantWa" :href="merchantWa" target="_blank" rel="noopener">💬 WhatsApp 联系商家</a>
 
-        <button class="btn btn--block btn--pill btn--danger" v-if="order.status === 'pending'" @click="cancel">取消订单</button>
+        <button class="btn btn--block btn--pill btn--danger" v-if="order.status === 'pending'" :disabled="order._cancelling" @click="cancel">{{ order._cancelling ? '取消中…' : '取消订单' }}</button>
         <button class="btn btn--block btn--pill btn--ghost" @click="$emit('neworder')">再点一单</button>
         </template>
       </div>
